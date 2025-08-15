@@ -1,0 +1,404 @@
+import asyncio
+import json
+import logging
+import sys
+from typing import Any, Dict, List, Optional
+from pathlib import Path
+
+# Adjust sys.path to allow imports from the project root (so `app` can be imported)
+project_root = str(Path(__file__).resolve().parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from app.services.browser_service import BrowserService
+from app.services.session_service import SessionManager
+from app.core.config import settings
+from app.core.logging import setup_logging, get_logger
+from app.core.exceptions import (
+    BrowserAutomationError,
+    SessionNotFoundError,
+    NavigationError,
+    ElementError,
+    InvalidURLError,
+    ElementNotFoundError,
+    ElementNotInteractableError,
+    InvalidSelectorError,
+    MCPError,
+    ToolNotFoundError,
+    InvalidToolArgumentsError
+)
+
+# Import necessary types from mcp.server or mcp.types if they are exposed
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp import types as mcp_types
+
+# Setup logging for the MCP server
+setup_logging()
+logger = get_logger(__name__)
+
+class BrowserAutomationMCPServer:
+    def __init__(self):
+        self.browser_service = BrowserService(
+            max_browsers=settings.MAX_BROWSER_INSTANCES,
+            max_contexts_per_browser=settings.MAX_CONTEXTS_PER_BROWSER,
+            headless=settings.BROWSER_HEADLESS,
+            timeout=settings.BROWSER_TIMEOUT
+        )
+        self.session_manager = SessionManager()
+        # Initialize Server without 'description' argument
+        self.mcp_server = Server(name="browser_automation_mcp_server")
+
+        # Register handlers with the MCP server
+        self.mcp_server.list_tools()(self._list_tools)
+        self.mcp_server.call_tool(validate_input=True)(self._call_tool)
+        self.mcp_server.list_resource_templates()(self._list_resource_templates)
+        self.mcp_server.read_resource()(self._read_resource)
+
+    # Underlying implementation for tools
+    async def create_session(self, **kwargs) -> Dict[str, Any]:
+        session_id = kwargs.get("session_id")
+        browser_type = kwargs.get("browser_type")
+        headless = kwargs.get("headless")
+        viewport_width = kwargs.get("viewport_width")
+        viewport_height = kwargs.get("viewport_height")
+
+        try:
+            session_info = await self.browser_service.create_session(
+                session_id=session_id,
+                browser_type=browser_type,
+                headless=headless,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height
+            )
+            await self.session_manager.register_session(session_info["session_id"], session_info)
+            logger.info(f"Session {session_info['session_id']} created successfully.")
+            return {"session_id": session_info['session_id'], "message": "Session created successfully."}
+        except BrowserAutomationError as e:
+            logger.error(f"Failed to create session: {e.message}", exc_info=True)
+            raise MCPError(f"Failed to create session: {e.message}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during session creation: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def close_session(self, session_id: str) -> Dict[str, Any]:
+        try:
+            await self.browser_service.close_session(session_id)
+            await self.session_manager.unregister_session(session_id)
+            logger.info(f"Session {session_id} closed successfully.")
+            return {"session_id": session_id, "message": "Session closed successfully."}
+        except SessionNotFoundError as e:
+            logger.warning(f"Attempted to close non-existent session {session_id}.")
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except BrowserAutomationError as e:
+            logger.error(f"Failed to close session {session_id}: {e.message}", exc_info=True)
+            raise MCPError(f"Failed to close session: {e.message}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during session closing: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def navigate(self, session_id: str, url: str, wait_until: Optional[str] = "load") -> Dict[str, Any]:
+        try:
+            await self.browser_service.navigate(session_id, url, wait_until)
+            await self.session_manager.update_session_activity(session_id, "navigate", {"url": url})
+            logger.info(f"Session {session_id} navigated to {url}.")
+            return {"session_id": session_id, "url": url, "message": "Navigation successful."}
+        except (NavigationError, InvalidURLError) as e:
+            logger.error(f"Navigation failed for session {session_id} to {url}: {e.message}", exc_info=True)
+            raise MCPError(f"Navigation failed: {e.message}", details=e.to_dict())
+        except SessionNotFoundError as e:
+            logger.warning(f"Navigation attempt on non-existent session {session_id}.")
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during navigation: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def click_element(self, session_id: str, selector: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        try:
+            await self.browser_service.click_element(session_id, selector, timeout)
+            await self.session_manager.update_session_activity(session_id, "click", {"selector": selector})
+            logger.info(f"Session {session_id} clicked element {selector}.")
+            return {"session_id": session_id, "selector": selector, "message": "Element clicked successfully."}
+        except (ElementError, ElementNotFoundError, ElementNotInteractableError, InvalidSelectorError) as e:
+            logger.error(f"Click failed for session {session_id} on {selector}: {e.message}", exc_info=True)
+            raise MCPError(f"Click failed: {e.message}", details=e.to_dict())
+        except SessionNotFoundError as e:
+            logger.warning(f"Click attempt on non-existent session {session_id}.")
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during click: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def type_text(self, session_id: str, selector: str, text: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        try:
+            await self.browser_service.type_text(session_id, selector, text, timeout)
+            await self.session_manager.update_session_activity(session_id, "type", {"selector": selector, "text_length": len(text)})
+            logger.info(f"Session {session_id} typed into element {selector}.")
+            return {"session_id": session_id, "selector": selector, "message": "Text typed successfully."}
+        except (ElementError, ElementNotFoundError, ElementNotInteractableError, InvalidSelectorError) as e:
+            logger.error(f"Type failed for session {session_id} on {selector}: {e.message}", exc_info=True)
+            raise MCPError(f"Type failed: {e.message}", details=e.to_dict())
+        except SessionNotFoundError as e:
+            logger.warning(f"Type attempt on non-existent session {session_id}.")
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during type: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def get_page_content(self, session_id: str) -> Dict[str, Any]:
+        try:
+            content = await self.browser_service.get_page_content(session_id)
+            await self.session_manager.update_session_activity(session_id, "get_content", {"content_length": len(content)})
+            logger.info(f"Session {session_id} retrieved page content.")
+            return {"session_id": session_id, "content": content, "message": "Page content retrieved successfully."}
+        except SessionNotFoundError as e:
+            logger.warning(f"Get content attempt on non-existent session {session_id}.")
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except BrowserAutomationError as e:
+            logger.error(f"Failed to get page content for session {session_id}: {e.message}", exc_info=True)
+            raise MCPError(f"Failed to get page content: {e.message}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during get_page_content: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def take_screenshot(self, session_id: str, full_page: Optional[bool] = False, encoding: Optional[str] = "base64") -> Dict[str, Any]:
+        try:
+            image_data = await self.browser_service.take_screenshot(session_id, full_page, encoding)
+            await self.session_manager.update_session_activity(session_id, "screenshot", {"full_page": full_page, "encoding": encoding})
+            logger.info(f"Session {session_id} took screenshot.")
+            return {"session_id": session_id, "image_data": image_data, "message": "Screenshot taken successfully."}
+        except SessionNotFoundError as e:
+            logger.warning(f"Screenshot attempt on non-existent session {session_id}.")
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except BrowserAutomationError as e:
+            logger.error(f"Failed to take screenshot for session {session_id}: {e.message}", exc_info=True)
+            raise MCPError(f"Failed to take screenshot: {e.message}", details=e.to_dict())
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during screenshot: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    # MCP server registration handlers
+    async def _list_tools(self) -> List[mcp_types.Tool]:
+        """Return the list of tools supported by this server."""
+        return [
+            mcp_types.Tool(
+                name="create_session",
+                description="Creates a new browser automation session.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "Optional: A unique ID for the session. If not provided, one will be generated.", "nullable": True},
+                        "browser_type": {"type": "string", "enum": ["chromium", "firefox", "webkit"], "description": "Optional: The type of browser to launch (chromium, firefox, or webkit). Defaults to chromium.", "nullable": True},
+                        "headless": {"type": "boolean", "description": "Optional: Whether to run the browser in headless mode. Defaults to server configuration.", "nullable": True},
+                        "viewport_width": {"type": "integer", "description": "Optional: The width of the browser viewport.", "nullable": True},
+                        "viewport_height": {"type": "integer", "description": "Optional: The height of the browser viewport.", "nullable": True}
+                    }
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="close_session",
+                description="Closes an existing browser automation session.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The ID of the session to close."}
+                    },
+                    "required": ["session_id"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="navigate",
+                description="Navigates the browser in a session to a specified URL.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The ID of the session."},
+                        "url": {"type": "string", "description": "The URL to navigate to."},
+                        "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "description": "Optional: When to consider navigation successful. Defaults to 'load'.", "nullable": True}
+                    },
+                    "required": ["session_id", "url"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "url": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="click_element",
+                description="Clicks an element identified by a CSS selector or XPath.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The ID of the session."},
+                        "selector": {"type": "string", "description": "CSS selector or XPath of the element to click."},
+                        "timeout": {"type": "integer", "description": "Optional: Maximum time in milliseconds to wait for the element. Defaults to 30000.", "nullable": True}
+                    },
+                    "required": ["session_id", "selector"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "selector": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="type_text",
+                description="Types text into an element identified by a CSS selector or XPath.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The ID of the session."},
+                        "selector": {"type": "string", "description": "CSS selector or XPath of the element to type into."},
+                        "text": {"type": "string", "description": "The text to type."},
+                        "timeout": {"type": "integer", "description": "Optional: Maximum time in milliseconds to wait for the element. Defaults to 30000.", "nullable": True}
+                    },
+                    "required": ["session_id", "selector", "text"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "selector": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="get_page_content",
+                description="Retrieves the full HTML content of the current page in a session.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The ID of the session."}
+                    },
+                    "required": ["session_id"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "content": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="take_screenshot",
+                description="Takes a screenshot of the current page in a session.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "The ID of the session."},
+                        "full_page": {"type": "boolean", "description": "Optional: Whether to take a screenshot of the full scrollable page. Defaults to false.", "nullable": True},
+                        "encoding": {"type": "string", "enum": ["base64", "binary"], "description": "Optional: Encoding for the image data. Defaults to base64.", "nullable": True}
+                    },
+                    "required": ["session_id"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "image_data": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+        ]
+
+    async def _call_tool(self, tool_name: str, arguments: Dict[str, Any]):
+        """Dispatch tool calls based on name and arguments."""
+        try:
+            if tool_name == "create_session":
+                return await self.create_session(**arguments)
+            elif tool_name == "close_session":
+                return await self.close_session(**arguments)
+            elif tool_name == "navigate":
+                return await self.navigate(**arguments)
+            elif tool_name == "click_element":
+                return await self.click_element(**arguments)
+            elif tool_name == "type_text":
+                return await self.type_text(**arguments)
+            elif tool_name == "get_page_content":
+                return await self.get_page_content(**arguments)
+            elif tool_name == "take_screenshot":
+                return await self.take_screenshot(**arguments)
+            else:
+                raise ToolNotFoundError(tool_name)
+        except BrowserAutomationError as e:
+            raise MCPError(e.message, details=e.to_dict())
+        except SessionNotFoundError as e:
+            raise MCPError(f"Session not found: {arguments.get('session_id','')}", details=e.to_dict())
+        except Exception as e:
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def _list_resource_templates(self) -> List[mcp_types.ResourceTemplate]:
+        return [
+            mcp_types.ResourceTemplate(
+                name="session_info",
+                uriTemplate="session_info/{session_id}",
+                description="Provides information about a specific browser session.",
+                mimeType="application/json",
+            ),
+            mcp_types.ResourceTemplate(
+                name="active_sessions",
+                uriTemplate="active_sessions",
+                description="Lists all currently active browser sessions.",
+                mimeType="application/json",
+            ),
+        ]
+
+    async def _read_resource(self, uri: str):
+        try:
+            if uri.startswith("session_info/"):
+                session_id = uri.split("/", 1)[1]
+                session_info = await self.session_manager.get_session_info(session_id)
+                if not session_info:
+                    raise SessionNotFoundError(session_id)
+                payload = json.dumps({"session_id": session_id, "info": session_info, "message": "Session info retrieved."})
+                return [mcp_types.TextResourceContents(uri=uri, text=payload, mimeType="application/json")]
+            elif uri == "active_sessions":
+                active_sessions = await self.session_manager.get_all_sessions()
+                payload = json.dumps({"sessions": active_sessions, "message": "Active sessions listed."})
+                return [mcp_types.TextResourceContents(uri=uri, text=payload, mimeType="application/json")]
+            else:
+                raise ToolNotFoundError(uri)
+        except SessionNotFoundError as e:
+            raise MCPError(f"Session not found: {uri}", details=e.to_dict())
+        except Exception as e:
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def run(self):
+        logger.info("Starting MCP Server over stdio")
+        async with stdio_server() as (read_stream, write_stream):
+            init_opts = self.mcp_server.create_initialization_options()
+            await self.mcp_server.run(read_stream, write_stream, init_opts)
+
+async def main():
+    mcp_server_instance = BrowserAutomationMCPServer()
+    await mcp_server_instance.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+

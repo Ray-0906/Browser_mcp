@@ -1,0 +1,180 @@
+# Browser Automation MCP Server
+
+Browser automation tools and resources exposed over the Model Context Protocol (MCP), plus an optional FastAPI REST API. Playwright powers the browser automation.
+
+## Features
+
+ - MCP tools: create/close session, navigate, click, type, get page content, take screenshot.
+ - Resources: active_sessions, session_info/{session_id}.
+ - Playwright for Chromium/Firefox/WebKit.
+ - Optional FastAPI app for HTTP endpoints.
+
+## Setup Instructions
+
+Follow these steps to set up and run the Browser Automation MCP Server on your local machine.
+
+### Prerequisites
+
+Before you begin, ensure you have the following installed:
+
+ *   **Python 3.9+**: Download from [python.org](https://www.python.org/downloads/).
+ *   **uv**: A fast Python package installer and resolver. If you don't have it, install it using pip:
+     ```bash
+     pip install uv
+     ```
+
+### 1. Clone the Repository
+
+First, clone this repository to your local machine:
+
+```bash
+# Assuming you have received the project archive, extract it.
+# For example, if it's a .tar.gz file:
+# tar -xzf browser_automation_mcp_server_uv.tar.gz
+# cd browser_automation_mcp_server_uv
+```
+
+### 2. Install Dependencies using `uv`
+
+Navigate to the project root directory (where `requirements.txt` is located) and install the dependencies. `uv` will automatically create a virtual environment if one doesn't exist.
+
+```bash
+cd C:\Users\astra\Desktop\browser_automation_mcp_server_uv
+uv pip install -r requirements.txt
+```
+
+This command will:
+ *   Create a virtual environment (e.g., `.venv` or `env`) if it doesn't exist.
+ *   Install all required Python packages listed in `requirements.txt` into this environment.
+
+### 3. Install Playwright Browsers
+
+After installing the Python dependencies, you need to install the actual browser binaries that Playwright will use. This is done via the `playwright` command-line tool, which is installed as part of the `playwright` Python package.
+
+```bash
+uv run playwright install
+```
+
+This command will download and install Chromium, Firefox, and WebKit browsers.
+
+## Running the Servers
+
+The Browser Automation MCP Server consists of two main components that need to run concurrently:
+
+1.  **The MCP Server**: Handles the Model Context Protocol communication and registers the browser automation tools and resources.
+2.  **The FastAPI Application**: Provides a RESTful API for interacting with the browser automation functionalities.
+
+### 1. Start the MCP Server
+
+Open your first terminal window, navigate to the project root directory, and run the MCP server:
+
+```bash
+cd C:\Users\astra\Desktop\browser_automation_mcp_server_uv
+uv run python mcp_server.py
+```
+
+You should see output indicating that the MCP Server is starting on `0.0.0.0:8001`.
+
+### 2. Start the FastAPI Application
+
+Open a **second terminal window**, navigate to the project root directory, and run the FastAPI application using Uvicorn:
+
+```bash
+cd C:\Users\astra\Desktop\browser_automation_mcp_server_uv
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+*   `--host 0.0.0.0`: Makes the server accessible from any IP address.
+*   `--port 8000`: Specifies the port for the FastAPI server.
+*   `--reload`: Enables auto-reloading of the server when code changes are detected (useful during development).
+
+You should see output indicating that the FastAPI application is running on `http://0.0.0.0:8000`.
+
+### 3. Access the API Documentation
+
+Once both servers are running, you can access the interactive API documentation (Swagger UI) for the FastAPI application by opening your web browser and navigating to:
+
+[http://localhost:8000/docs](http://localhost:8000/docs)
+
+Here, you can explore all available endpoints for browser automation, test them, and understand their request/response schemas.
+
+## Troubleshooting
+
+*   **`ModuleNotFoundError`**: Ensure you are running commands with `uv run` or that your virtual environment is activated (`source .venv/bin/activate` on Linux/macOS, `.\.venv\Scripts\Activate.ps1` on Windows PowerShell, or `.\.venv\Scripts\activate.bat` on Windows Command Prompt).
+*   **`TypeError: 'Settings' object is not subscriptable`**: This indicates a version mismatch or incorrect file content. Ensure your `app/main.py` and `app/core/config.py` files are exactly as provided in the latest codebase. This error specifically means `settings["APP_VERSION"]` is being used instead of `settings.APP_VERSION`.
+*   **`AttributeError: 'Server' object has no attribute 'register_tool'`**: This means your `mcp_server.py` is not updated to use the decorator-based tool registration. Ensure you have the latest `mcp_server.py` content.
+*   **`ValidationError` for Tool/Resource schemas**: Ensure that your `input_schema` and `output_schema` dictionaries within `@Tool` and `@Resource` decorators start with `"type": "object",`.
+*   **Playwright Browser Issues**: If browsers fail to launch, try `uv run playwright install --with-deps` to ensure all system dependencies are met.
+
+If you encounter persistent issues, please provide the full error traceback and the exact commands you are running. 
+
+## Windows setup (PowerShell)
+From the project root: `C:\Users\astra\Desktop\browser_automation_mcp_server_uv`
+
+1) Create/activate venv and install deps
+```powershell
+# Create venv (if not already present)
+py -3.11 -m venv .venv
+# Activate venv
+.\.venv\Scripts\Activate.ps1
+# Install Python packages
+python -m pip install -r requirements.txt
+# Install Playwright browsers
+python -m playwright install
+```
+
+2) Use with Claude Desktop (MCP)
+- Edit config file: %APPDATA%\Claude\claude_desktop_config.json
+- Add this entry:
+```json
+{
+    "mcpServers": {
+        "browser-automation": {
+            "command": "C:/Users/astra/Desktop/browser_automation_mcp_server_uv/.venv/Scripts/python.exe",
+            "args": ["C:/Users/astra/Desktop/browser_automation_mcp_server_uv/mcp_server.py"],
+            "cwd": "C:/Users/astra/Desktop/browser_automation_mcp_server_uv",
+            "env": {}
+        }
+    }
+}
+```
+- Restart Claude Desktop, open a new chat, and ask: “List available tools.”
+
+3) Optional: run FastAPI locally
+```powershell
+# From an activated venv
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+# Open docs
+# http://127.0.0.1:8000/docs
+```
+
+## MCP quick tests (prompts for Claude)
+- Use tool create_session with arguments: { "browser_type": "chromium", "headless": true }
+- Use tool navigate with arguments: { "session_id": "<SESSION_ID>", "url": "https://example.com" }
+- Use tool click_element with arguments: { "session_id": "<SESSION_ID>", "selector": "a.more-info" }
+- Use tool type_text with arguments: { "session_id": "<SESSION_ID>", "selector": "input[name='q']", "text": "playwright mcp" }
+- Use tool get_page_content with arguments: { "session_id": "<SESSION_ID>" }
+- Use tool take_screenshot with arguments: { "session_id": "<SESSION_ID>", "full_page": true, "encoding": "base64" }
+- Use tool close_session with arguments: { "session_id": "<SESSION_ID>" }
+
+Resources:
+- Read resource active_sessions
+- Read resource session_info/<SESSION_ID>
+
+## Troubleshooting
+- Playwright browsers: If a first run fails, try installing again in the active venv:
+```powershell
+python -m playwright install
+```
+- Claude cannot start server: Recheck paths in claude_desktop_config.json point to your venv Python and mcp_server.py.
+- Nothing happens when running mcp_server.py directly: That’s expected; it waits for an MCP client over stdio.
+- Logs: see `logs/app.log`.
+
+## Project structure
+- `mcp_server.py`: MCP server wiring using mcp.server (stdio transport).
+- `app/`: FastAPI app, core config/logging/security, and services (Playwright + sessions).
+
+## License
+MIT (or your preferred license)
+
+
