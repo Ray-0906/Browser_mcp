@@ -155,13 +155,23 @@ class BrowserService:
                 raise InvalidSelectorError(selector)
             raise ElementError(selector, message=str(e))
 
-    async def get_page_content(self, session_id: str) -> str:
+    async def get_page_content(self, session_id: str, selector: Optional[str] = None, content_format: str = "html") -> str:
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)
         try:
             page = self.pages[session_id]
-            content = await page.content()
-            logger.info(f"Session {session_id} retrieved page content")
+            if selector:
+                locator = page.locator(selector).first
+                if content_format == "text":
+                    content = await locator.inner_text()
+                else:
+                    content = await locator.inner_html()
+            else:
+                if content_format == "text":
+                    content = await page.inner_text("body")
+                else:
+                    content = await page.content()
+            logger.info(f"Session {session_id} retrieved page content (format={content_format}, selector={selector})")
             return content
         except Exception as e:
             logger.error(f"Error getting page content for session {session_id}: {e}", exc_info=True)

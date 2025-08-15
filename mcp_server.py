@@ -145,12 +145,32 @@ class BrowserAutomationMCPServer:
             logger.error(f"An unexpected error occurred during type: {e}", exc_info=True)
             raise MCPError(f"Unexpected error: {e}")
 
-    async def get_page_content(self, session_id: str) -> Dict[str, Any]:
+    async def get_page_content(
+        self,
+        session_id: str,
+        selector: Optional[str] = None,
+        content_format: Optional[str] = "html",
+        max_chars: Optional[int] = None,
+        return_content: Optional[bool] = True,
+    ) -> Dict[str, Any]:
         try:
-            content = await self.browser_service.get_page_content(session_id)
-            await self.session_manager.update_session_activity(session_id, "get_content", {"content_length": len(content)})
+            content = await self.browser_service.get_page_content(session_id, selector=selector, content_format=content_format or "html")
+            if isinstance(max_chars, int) and max_chars > 0 and len(content) > max_chars:
+                content = content[:max_chars]
+            metrics: Dict[str, Any] = {"content_length": len(content), "format": content_format or "html"}
+            if selector is not None:
+                metrics["selector"] = selector
+            await self.session_manager.update_session_activity(session_id, "get_content", metrics)
             logger.info(f"Session {session_id} retrieved page content.")
-            return {"session_id": session_id, "content": content, "message": "Page content retrieved successfully."}
+            result: Dict[str, Any] = {"session_id": session_id, "message": "Page content retrieved successfully.", **metrics}
+            if return_content:
+                result["content"] = content
+            else:
+                # Provide a resource URI to read the full or truncated content separately
+                fmt = (content_format or "html")
+                sel = selector if selector is not None else ""
+                result["resource_uri"] = f"page_content/{session_id}?format={fmt}&selector={sel}"
+            return result
         except SessionNotFoundError as e:
             logger.warning(f"Get content attempt on non-existent session {session_id}.")
             raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
@@ -175,6 +195,52 @@ class BrowserAutomationMCPServer:
             raise MCPError(f"Failed to take screenshot: {e.message}", details=e.to_dict())
         except Exception as e:
             logger.error(f"An unexpected error occurred during screenshot: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def get_text_excerpt(self, session_id: str, selector: Optional[str] = None, max_chars: Optional[int] = 5000) -> Dict[str, Any]:
+        try:
+            text = await self.browser_service.get_page_content(session_id, selector=selector, content_format="text")
+            truncated_to: Optional[int] = None
+            if isinstance(max_chars, int) and max_chars > 0 and len(text) > max_chars:
+                text = text[:max_chars]
+                truncated_to = max_chars
+            metrics: Dict[str, Any] = {"content_length": len(text)}
+            if truncated_to is not None:
+                metrics["truncated_to"] = truncated_to
+            if selector is not None:
+                metrics["selector"] = selector
+            await self.session_manager.update_session_activity(session_id, "get_text_excerpt", metrics)
+            return {"session_id": session_id, "excerpt": text, "message": "Excerpt retrieved.", **metrics}
+        except SessionNotFoundError as e:
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except BrowserAutomationError as e:
+            raise MCPError(e.message, details=e.to_dict())
+        except Exception as e:
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def get_links(self, session_id: str, selector: Optional[str] = None, max_links: Optional[int] = 20) -> Dict[str, Any]:
+        try:
+            # Use page-level extraction to minimize data
+            # Accessing service internals for the page
+            if session_id not in self.browser_service.pages:
+                raise SessionNotFoundError(session_id)
+            page = self.browser_service.pages[session_id]
+            scope = selector or "a"
+            all_links = await page.eval_on_selector_all(
+                scope,
+                "els => els.map(e => ({ text: (e.innerText||'').trim(), href: e.getAttribute('href') || '' }))"
+            )
+            # Filter and limit
+            filtered = [l for l in all_links if l.get("href")]
+            if isinstance(max_links, int) and max_links > 0:
+                filtered = filtered[:max_links]
+            await self.session_manager.update_session_activity(session_id, "get_links", {"count": len(filtered), "selector": scope})
+            return {"session_id": session_id, "links": filtered, "count": len(filtered), "selector": scope, "message": "Links extracted."}
+        except SessionNotFoundError as e:
+            raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+        except BrowserAutomationError as e:
+            raise MCPError(e.message, details=e.to_dict())
+        except Exception as e:
             raise MCPError(f"Unexpected error: {e}")
 
     # MCP server registration handlers
@@ -286,11 +352,15 @@ class BrowserAutomationMCPServer:
             ),
             mcp_types.Tool(
                 name="get_page_content",
-                description="Retrieves the full HTML content of the current page in a session.",
+                description="Retrieve page content as HTML or plain text, optionally scoped to a selector and truncated to avoid token limits.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "session_id": {"type": "string", "description": "The ID of the session."}
+                        "session_id": {"type": "string", "description": "The ID of the session."},
+                        "selector": {"type": ["string", "null"], "description": "Optional CSS/XPath selector to scope extraction."},
+                        "content_format": {"type": "string", "enum": ["html", "text"], "description": "Return HTML or plain text.", "nullable": True},
+                        "max_chars": {"type": "integer", "description": "Optional: truncate content to this many characters to avoid token limits.", "nullable": True},
+                        "return_content": {"type": "boolean", "description": "Return content inline (true) or provide only metadata and a resource URI (false).", "nullable": True}
                     },
                     "required": ["session_id"]
                 },
@@ -299,6 +369,10 @@ class BrowserAutomationMCPServer:
                     "properties": {
                         "session_id": {"type": "string"},
                         "content": {"type": "string"},
+                        "resource_uri": {"type": "string"},
+                        "content_length": {"type": "integer"},
+                        "format": {"type": "string"},
+                        "selector": {"type": ["string", "null"]},
                         "message": {"type": "string"}
                     }
                 },
@@ -324,6 +398,62 @@ class BrowserAutomationMCPServer:
                     }
                 },
             ),
+            mcp_types.Tool(
+                name="get_text_excerpt",
+                description="Retrieve a truncated plain-text excerpt of the page or a selector to fit token limits.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "selector": {"type": ["string", "null"]},
+                        "max_chars": {"type": "integer", "nullable": True}
+                    },
+                    "required": ["session_id"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "excerpt": {"type": "string"},
+                        "content_length": {"type": "integer"},
+                        "truncated_to": {"type": "integer"},
+                        "selector": {"type": ["string", "null"]},
+                        "message": {"type": "string"}
+                    }
+                }
+            ),
+            mcp_types.Tool(
+                name="get_links",
+                description="Extract up to N links (text + href) from the page or a selector to minimize tokens.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "selector": {"type": ["string", "null"], "description": "Optional scope; defaults to 'a'"},
+                        "max_links": {"type": "integer", "description": "Limit number of links", "nullable": True}
+                    },
+                    "required": ["session_id"]
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "links": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "text": {"type": "string"},
+                                    "href": {"type": "string"}
+                                }
+                            }
+                        },
+                        "count": {"type": "integer"},
+                        "selector": {"type": ["string", "null"]},
+                        "message": {"type": "string"}
+                    }
+                }
+            ),
         ]
 
     async def _call_tool(self, tool_name: str, arguments: Dict[str, Any]):
@@ -343,6 +473,10 @@ class BrowserAutomationMCPServer:
                 return await self.get_page_content(**arguments)
             elif tool_name == "take_screenshot":
                 return await self.take_screenshot(**arguments)
+            elif tool_name == "get_text_excerpt":
+                return await self.get_text_excerpt(**arguments)
+            elif tool_name == "get_links":
+                return await self.get_links(**arguments)
             else:
                 raise ToolNotFoundError(tool_name)
         except BrowserAutomationError as e:
@@ -366,6 +500,12 @@ class BrowserAutomationMCPServer:
                 description="Lists all currently active browser sessions.",
                 mimeType="application/json",
             ),
+            mcp_types.ResourceTemplate(
+                name="page_content",
+                uriTemplate="page_content/{session_id}?format={format}&selector={selector}",
+                description="Retrieve page content for a session with optional format and selector.",
+                mimeType="application/json",
+            ),
         ]
 
     async def _read_resource(self, uri: str):
@@ -380,6 +520,25 @@ class BrowserAutomationMCPServer:
             elif uri == "active_sessions":
                 active_sessions = await self.session_manager.get_all_sessions()
                 payload = json.dumps({"sessions": active_sessions, "message": "Active sessions listed."})
+                return [mcp_types.TextResourceContents(uri=uri, text=payload, mimeType="application/json")]
+            elif uri.startswith("page_content/"):
+                # rudimentary query parsing: page_content/{session_id}?format=html&selector=...
+                body = uri[len("page_content/"):]
+                if "?" in body:
+                    sid, qs = body.split("?", 1)
+                else:
+                    sid, qs = body, ""
+                params = {}
+                for pair in qs.split("&"):
+                    if not pair:
+                        continue
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        params[k] = v
+                content_format = params.get("format", "html")
+                selector = params.get("selector")
+                content = await self.browser_service.get_page_content(sid, selector=selector, content_format=content_format)
+                payload = json.dumps({"session_id": sid, "format": content_format, "selector": selector, "content": content})
                 return [mcp_types.TextResourceContents(uri=uri, text=payload, mimeType="application/json")]
             else:
                 raise ToolNotFoundError(uri)
