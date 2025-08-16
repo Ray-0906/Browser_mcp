@@ -66,7 +66,7 @@ class BrowserAutomationMCPServer:
         try:
             session_info = await self.browser_service.create_session(
                 session_id=session_id,
-                browser_type=browser_type,
+                browser_type=browser_type or "chromium",
                 headless=headless,
                 viewport_width=viewport_width,
                 viewport_height=viewport_height
@@ -79,6 +79,51 @@ class BrowserAutomationMCPServer:
             raise MCPError(f"Failed to create session: {e.message}", details=e.to_dict())
         except Exception as e:
             logger.error(f"An unexpected error occurred during session creation: {e}", exc_info=True)
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def connect_cdp(self, **kwargs) -> Dict[str, Any]:
+        session_id = kwargs.get("session_id")
+        cdp_url = kwargs.get("cdp_url") or "http://localhost:9222"
+        create_new_page = kwargs.get("create_new_page")
+        try:
+            session_info = await self.browser_service.connect_cdp_session(
+                session_id=session_id, cdp_url=cdp_url, create_new_page=create_new_page if create_new_page is not None else True
+            )
+            await self.session_manager.register_session(session_info["session_id"], session_info)
+            logger.info(f"CDP session {session_info['session_id']} connected to {cdp_url}.")
+            return {"session_id": session_info['session_id'], "cdp_url": cdp_url, "message": "Connected to visible Chrome via CDP."}
+        except BrowserAutomationError as e:
+            raise MCPError(f"Failed to connect via CDP: {e.message}", details=e.to_dict())
+        except Exception as e:
+            raise MCPError(f"Unexpected error: {e}")
+
+    async def launch_visible_chrome(self, **kwargs) -> Dict[str, Any]:
+        """Launch a visible Chrome/Edge with remote debugging and optionally auto-connect a session."""
+        cdp_port = kwargs.get("cdp_port") or 9222
+        user_data_dir = kwargs.get("user_data_dir")
+        exe_path = kwargs.get("exe_path")
+        additional_args = kwargs.get("additional_args") or []
+        auto_connect = kwargs.get("auto_connect") or False
+        create_new_page = kwargs.get("create_new_page")
+        try:
+            launch_info = await self.browser_service.launch_chrome_with_cdp(
+                cdp_port=cdp_port,
+                user_data_dir=user_data_dir,
+                exe_path=exe_path,
+                additional_args=additional_args,
+            )
+            result: Dict[str, Any] = {"cdp_url": launch_info["cdp_url"], "pid": launch_info["pid"], "user_data_dir": launch_info["user_data_dir"], "exe_path": launch_info["exe_path"]}
+            if auto_connect:
+                # Connect a new MCP session to the launched browser
+                session_info = await self.browser_service.connect_cdp_session(
+                    session_id=None, cdp_url=launch_info["cdp_url"], create_new_page=create_new_page if create_new_page is not None else True
+                )
+                await self.session_manager.register_session(session_info["session_id"], session_info)
+                result["session_id"] = session_info["session_id"]
+            return result
+        except BrowserAutomationError as e:
+            raise MCPError(f"Failed to launch visible Chrome: {e.message}", details=e.to_dict())
+        except Exception as e:
             raise MCPError(f"Unexpected error: {e}")
 
     async def close_session(self, session_id: str) -> Dict[str, Any]:
@@ -181,12 +226,36 @@ class BrowserAutomationMCPServer:
             logger.error(f"An unexpected error occurred during get_page_content: {e}", exc_info=True)
             raise MCPError(f"Unexpected error: {e}")
 
-    async def take_screenshot(self, session_id: str, full_page: Optional[bool] = False, encoding: Optional[str] = "base64") -> Dict[str, Any]:
+    async def take_screenshot(
+        self,
+        session_id: str,
+        full_page: Optional[bool] = False,
+        encoding: Optional[str] = "base64",
+        return_image: Optional[bool] = False,
+        image_format: Optional[str] = "png",
+        quality: Optional[int] = None,
+    ) -> Dict[str, Any]:
         try:
-            image_data = await self.browser_service.take_screenshot(session_id, full_page, encoding)
-            await self.session_manager.update_session_activity(session_id, "screenshot", {"full_page": full_page, "encoding": encoding})
-            logger.info(f"Session {session_id} took screenshot.")
-            return {"session_id": session_id, "image_data": image_data, "message": "Screenshot taken successfully."}
+            # Record activity regardless of return strategy
+            await self.session_manager.update_session_activity(
+                session_id, "screenshot", {"full_page": full_page, "encoding": encoding, "image_format": image_format}
+            )
+            logger.info(f"Session {session_id} requested screenshot (return_image={return_image}).")
+
+            result: Dict[str, Any] = {"session_id": session_id, "message": "Screenshot ready."}
+            if return_image:
+                # Inline image is explicitly requested (beware token usage)
+                image_data = await self.browser_service.take_screenshot(session_id, full_page, encoding or "base64")
+                result["image_data"] = image_data
+                result["mime_type"] = "image/png" if (image_format or "png") == "png" else "image/jpeg"
+            else:
+                # Provide a resource URI to fetch image separately; avoids dumping base64 into chat
+                fp = "true" if full_page else "false"
+                fmt = (image_format or "png")
+                q = str(quality) if isinstance(quality, int) else ""
+                result["resource_uri"] = f"screenshot/{session_id}?full_page={fp}&format={fmt}&quality={q}"
+                result["mime_type"] = "image/png" if fmt == "png" else "image/jpeg"
+            return result
         except SessionNotFoundError as e:
             logger.warning(f"Screenshot attempt on non-existent session {session_id}.")
             raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
@@ -264,6 +333,51 @@ class BrowserAutomationMCPServer:
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="launch_visible_chrome",
+                description="Launch a visible Chrome/Edge with remote debugging enabled and optionally auto-connect as a session.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "cdp_port": {"type": "integer", "description": "Remote debugging port (default 9222)", "nullable": True},
+                        "user_data_dir": {"type": ["string", "null"], "description": "Profile dir used by the launched browser."},
+                        "exe_path": {"type": ["string", "null"], "description": "Path to chrome.exe/msedge.exe. If not provided, common Windows paths and PATH are tried."},
+                        "additional_args": {"type": "array", "items": {"type": "string"}, "description": "Extra flags to pass to the browser.", "nullable": True},
+                        "auto_connect": {"type": "boolean", "description": "If true, automatically create and return a session attached via CDP.", "nullable": True},
+                        "create_new_page": {"type": "boolean", "description": "Open a new tab on connect when auto_connect.", "nullable": True}
+                    }
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "cdp_url": {"type": "string"},
+                        "pid": {"type": "integer"},
+                        "user_data_dir": {"type": "string"},
+                        "exe_path": {"type": "string"},
+                        "session_id": {"type": "string"}
+                    }
+                },
+            ),
+            mcp_types.Tool(
+                name="connect_cdp",
+                description="Attach to a user-launched Chrome/Chromium in visible mode via CDP (remote debugging).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": ["string", "null"], "description": "Optional: Provide to set a custom session id."},
+                        "cdp_url": {"type": "string", "description": "CDP endpoint, e.g., http://localhost:9222", "nullable": True},
+                        "create_new_page": {"type": "boolean", "description": "Open a new tab on connect (default true).", "nullable": True}
+                    }
+                },
+                outputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "cdp_url": {"type": "string"},
                         "message": {"type": "string"}
                     }
                 },
@@ -379,13 +493,16 @@ class BrowserAutomationMCPServer:
             ),
             mcp_types.Tool(
                 name="take_screenshot",
-                description="Takes a screenshot of the current page in a session.",
+        description="Takes a screenshot of the current page in a session. Defaults to returning a resource URI instead of inline image data to avoid token limits.",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string", "description": "The ID of the session."},
                         "full_page": {"type": "boolean", "description": "Optional: Whether to take a screenshot of the full scrollable page. Defaults to false.", "nullable": True},
-                        "encoding": {"type": "string", "enum": ["base64", "binary"], "description": "Optional: Encoding for the image data. Defaults to base64.", "nullable": True}
+            "encoding": {"type": "string", "enum": ["base64", "binary"], "description": "Optional: Encoding when returning inline image_data.", "nullable": True},
+            "return_image": {"type": "boolean", "description": "If true, return inline image_data (may be very large). If false, return a resource_uri.", "nullable": True},
+            "image_format": {"type": "string", "enum": ["png", "jpeg"], "description": "Image format when generating the screenshot.", "nullable": True},
+            "quality": {"type": "integer", "description": "JPEG quality 0-100 (only used when format=jpeg).", "nullable": True}
                     },
                     "required": ["session_id"]
                 },
@@ -393,7 +510,9 @@ class BrowserAutomationMCPServer:
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string"},
-                        "image_data": {"type": "string"},
+            "image_data": {"type": "string"},
+            "resource_uri": {"type": "string"},
+            "mime_type": {"type": "string"},
                         "message": {"type": "string"}
                     }
                 },
@@ -473,6 +592,10 @@ class BrowserAutomationMCPServer:
                 return await self.get_page_content(**arguments)
             elif tool_name == "take_screenshot":
                 return await self.take_screenshot(**arguments)
+            elif tool_name == "connect_cdp":
+                return await self.connect_cdp(**arguments)
+            elif tool_name == "launch_visible_chrome":
+                return await self.launch_visible_chrome(**arguments)
             elif tool_name == "get_text_excerpt":
                 return await self.get_text_excerpt(**arguments)
             elif tool_name == "get_links":
@@ -505,6 +628,12 @@ class BrowserAutomationMCPServer:
                 uriTemplate="page_content/{session_id}?format={format}&selector={selector}",
                 description="Retrieve page content for a session with optional format and selector.",
                 mimeType="application/json",
+            ),
+            mcp_types.ResourceTemplate(
+                name="screenshot",
+                uriTemplate="screenshot/{session_id}?full_page={full_page}&format={format}&quality={quality}",
+                description="Retrieve a screenshot for a session as binary image content.",
+                mimeType="application/octet-stream",
             ),
         ]
 
@@ -540,6 +669,27 @@ class BrowserAutomationMCPServer:
                 content = await self.browser_service.get_page_content(sid, selector=selector, content_format=content_format)
                 payload = json.dumps({"session_id": sid, "format": content_format, "selector": selector, "content": content})
                 return [mcp_types.TextResourceContents(uri=uri, text=payload, mimeType="application/json")]
+            elif uri.startswith("screenshot/"):
+                # screenshot/{session_id}?full_page=true&format=png&quality=80
+                body = uri[len("screenshot/"):]
+                if "?" in body:
+                    sid, qs = body.split("?", 1)
+                else:
+                    sid, qs = body, ""
+                params = {}
+                for pair in qs.split("&"):
+                    if not pair:
+                        continue
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        params[k] = v
+                full_page = params.get("full_page", "false").lower() == "true"
+                image_format = params.get("format", "png")
+                quality = params.get("quality")
+                q_int = int(quality) if (quality and quality.isdigit()) else None
+                data = await self.browser_service.take_screenshot_bytes(sid, full_page=full_page, image_format=image_format, quality=q_int)
+                mime = "image/png" if image_format == "png" else "image/jpeg"
+                return [mcp_types.BinaryResourceContents(uri=uri, blob=data, mimeType=mime)]
             else:
                 raise ToolNotFoundError(uri)
         except SessionNotFoundError as e:

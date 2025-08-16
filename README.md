@@ -4,8 +4,8 @@ Browser automation tools and resources exposed over the Model Context Protocol (
 
 ## Features
 
- - MCP tools: create/close session, navigate, click, type, get page content, take screenshot.
- - Resources: active_sessions, session_info/{session_id}.
+ - MCP tools: create/close session, navigate, click, type, get page content, take screenshot, get text excerpt, get links, connect to visible Chrome via CDP.
+ - Resources: active_sessions, session_info/{session_id}, page_content/{session_id}?... and screenshot/{session_id}?...
  - Playwright for Chromium/Firefox/WebKit.
  - Optional FastAPI app for HTTP endpoints.
 
@@ -73,7 +73,7 @@ cd C:\Users\astra\Desktop\browser_automation_mcp_server_uv
 uv run python mcp_server.py
 ```
 
-You should see output indicating that the MCP Server is starting on `0.0.0.0:8001`.
+The MCP server runs over stdio and waits for an MCP client (e.g., Claude Desktop). No HTTP port is opened.
 
 ### 2. Start the FastAPI Application
 
@@ -154,12 +154,34 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 - Use tool click_element with arguments: { "session_id": "<SESSION_ID>", "selector": "a.more-info" }
 - Use tool type_text with arguments: { "session_id": "<SESSION_ID>", "selector": "input[name='q']", "text": "playwright mcp" }
 - Use tool get_page_content with arguments: { "session_id": "<SESSION_ID>" }
-- Use tool take_screenshot with arguments: { "session_id": "<SESSION_ID>", "full_page": true, "encoding": "base64" }
+- Use tool take_screenshot with arguments: { "session_id": "<SESSION_ID>", "full_page": true }
 - Use tool close_session with arguments: { "session_id": "<SESSION_ID>" }
 
 Resources:
 - Read resource active_sessions
 - Read resource session_info/<SESSION_ID>
+ - Read resource page_content/<SESSION_ID>?format=html&selector=
+ - Read resource screenshot/<SESSION_ID>?full_page=true&format=png
+
+### Token-safe screenshots
+- By default, `take_screenshot` returns a `resource_uri` (not inline base64) to avoid blowing token limits in chat UIs.
+- To fetch the binary image, ask your client to read the returned resource URI (e.g., `screenshot/<SESSION_ID>?full_page=false&format=png`).
+- If you absolutely need inline data, set `return_image: true` (beware: large payloads).
+
+Inputs:
+- `full_page` (bool): capture entire scrollable page.
+- `image_format` ("png"|"jpeg") and optional `quality` (for jpeg).
+- `return_image` (bool, default false): inline `image_data`.
+
+Outputs:
+- `resource_uri` and `mime_type` (default path), or `image_data` when `return_image=true`.
+
+### Connect to your own visible Chrome (CDP)
+1) Start Chrome with remote debugging:
+     - Windows PowerShell:
+         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\\temp\\chrome-debug"
+2) Use tool `connect_cdp` with arguments: { "cdp_url": "http://localhost:9222", "create_new_page": true }
+3) Navigate, click, type as usual. Closing the session will not close your Chrome.
 
 ## Troubleshooting
 - Playwright browsers: If a first run fails, try installing again in the active venv:
@@ -169,6 +191,7 @@ python -m playwright install
 - Claude cannot start server: Recheck paths in claude_desktop_config.json point to your venv Python and mcp_server.py.
 - Nothing happens when running mcp_server.py directly: That’s expected; it waits for an MCP client over stdio.
 - Logs: see `logs/app.log`.
+ - Screenshot responses too large: Don’t request inline `image_data`. Use the default `resource_uri` returned by `take_screenshot` and read that resource.
 
 ## Project structure
 - `mcp_server.py`: MCP server wiring using mcp.server (stdio transport).

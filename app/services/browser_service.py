@@ -1,5 +1,5 @@
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set, List
 import asyncio
 from uuid import uuid4
 from app.core.logging import get_logger
@@ -13,6 +13,9 @@ from app.core.exceptions import (
     ElementNotInteractableError,
     InvalidSelectorError
 )
+import os
+import sys
+import subprocess
 
 logger = get_logger(__name__)
 
@@ -22,11 +25,13 @@ class BrowserService:
         self.max_contexts_per_browser = max_contexts_per_browser
         self.headless = headless
         self.timeout = timeout
-        self.browsers: Dict[str, Browser] = {}
-        self.contexts: Dict[str, BrowserContext] = {}
-        self.pages: Dict[str, Page] = {}
+        self.browsers = {}
+        self.contexts = {}
+        self.pages = {}
         self.playwright_instance = None
         self._browser_counter = 0
+        # Track sessions connected via CDP to a user-managed browser (visible)
+        self._cdp_sessions = set()
 
     async def _launch_browser(self, browser_type: str = "chromium", headless: Optional[bool] = None) -> Browser:
         if not self.playwright_instance:
@@ -82,6 +87,47 @@ class BrowserService:
             logger.error(f"Error creating session {session_id}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to create session: {e}")
 
+    async def connect_cdp_session(self, session_id: Optional[str] = None, cdp_url: str = "http://localhost:9222", create_new_page: bool = True) -> Dict[str, Any]:
+        """Connect to an existing, user-launched Chromium/Chrome via CDP. Leaves the browser visible and user-controllable.
+
+        Steps to prepare Chrome manually (Windows example):
+        - "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\\temp\\chrome-debug"
+        Then call this method with cdp_url="http://localhost:9222".
+        """
+        try:
+            if not self.playwright_instance:
+                self.playwright_instance = await async_playwright().start()
+            if not session_id:
+                session_id = str(uuid4())
+            if session_id in self.pages:
+                raise BrowserAutomationError(f"Session ID {session_id} already exists.")
+
+            browser = await self.playwright_instance.chromium.connect_over_cdp(cdp_url)
+            # For persistent Chrome, there is usually a single context
+            contexts = browser.contexts
+            if not contexts:
+                # Fallback: some environments might expose a default context differently
+                context = await browser.new_context()
+            else:
+                context = contexts[0]
+
+            page: Optional[Page] = None
+            if create_new_page or not context.pages:
+                page = await context.new_page()
+            else:
+                page = context.pages[0]
+
+            browser_key = str(id(browser))
+            self.browsers[browser_key] = browser
+            self.contexts[session_id] = context
+            self.pages[session_id] = page
+            self._cdp_sessions.add(session_id)
+            logger.info(f"Connected CDP session: {session_id} via {cdp_url}")
+            return {"session_id": session_id, "browser_type": "chromium", "cdp_url": cdp_url, "headless": False}
+        except Exception as e:
+            logger.error(f"Error connecting CDP session {session_id} to {cdp_url}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to connect via CDP: {e}")
+
     async def close_session(self, session_id: str):
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)
@@ -89,7 +135,11 @@ class BrowserService:
             page = self.pages.pop(session_id)
             context = self.contexts.pop(session_id)
             await page.close()
-            await context.close()
+            # For CDP sessions (user-managed), do not close the persistent context/browser
+            if session_id in self._cdp_sessions:
+                self._cdp_sessions.discard(session_id)
+            else:
+                await context.close()
             logger.info(f"Closed session: {session_id}")
 
             # If the browser has no more contexts, close it
@@ -191,6 +241,28 @@ class BrowserService:
             logger.error(f"Error taking screenshot for session {session_id}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to take screenshot: {e}")
 
+    async def take_screenshot_bytes(self, session_id: str, full_page: bool = False, image_format: str = "png", quality: Optional[int] = None) -> bytes:
+        """Return raw screenshot bytes for use in MCP resources to avoid inline base64 in tool responses.
+
+        image_format: "png" or "jpeg". For "jpeg", optional quality (0-100) can be provided.
+        """
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+        try:
+            page = self.pages[session_id]
+            kwargs: Dict[str, Any] = {"full_page": full_page}
+            # Playwright uses "type" to specify image format
+            if image_format in ("png", "jpeg"):
+                kwargs["type"] = image_format
+                if image_format == "jpeg" and isinstance(quality, int):
+                    # Only JPEG supports quality
+                    kwargs["quality"] = max(0, min(100, quality))
+            screenshot_bytes: bytes = await page.screenshot(**kwargs)
+            return screenshot_bytes
+        except Exception as e:
+            logger.error(f"Error taking screenshot bytes for session {session_id}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to take screenshot: {e}")
+
     async def close_all_browsers(self):
         for session_id in list(self.pages.keys()):
             await self.close_session(session_id)
@@ -198,5 +270,76 @@ class BrowserService:
             await self.playwright_instance.stop()
             self.playwright_instance = None
         logger.info("All browsers and Playwright instance closed.")
+
+    async def launch_chrome_with_cdp(
+        self,
+        cdp_port: int = 9222,
+        user_data_dir: Optional[str] = None,
+        exe_path: Optional[str] = None,
+        additional_args: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Launch a visible Chrome/Chromium with remote debugging and return the CDP URL and process info.
+
+        If exe_path is not provided, tries common Windows install paths and then falls back to 'chrome.exe' on PATH.
+        """
+        try:
+            # Resolve executable path
+            candidates: List[str] = []
+            if exe_path:
+                candidates.append(exe_path)
+            else:
+                # Common Windows paths
+                candidates += [
+                    r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                    r"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+                ]
+                # Try Edge if Chrome isn't found
+                candidates += [
+                    r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+                    r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+                ]
+
+            resolved_exe = None
+            for p in candidates:
+                if os.path.isfile(p):
+                    resolved_exe = p
+                    break
+            if not resolved_exe:
+                # Fallback to PATH
+                resolved_exe = exe_path or "chrome.exe"
+
+            # Ensure user-data-dir
+            udd = user_data_dir or os.path.join(os.getcwd(), "chrome-debug-profile")
+            os.makedirs(udd, exist_ok=True)
+
+            args = [
+                resolved_exe,
+                f"--remote-debugging-port={cdp_port}",
+                f"--user-data-dir={udd}",
+            ]
+            if additional_args:
+                args.extend(additional_args)
+
+            creationflags = 0
+            popen_kwargs: Dict[str, Any] = {}
+            if sys.platform.startswith("win"):
+                # Detach so the browser stays open and doesn't block the server
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                popen_kwargs["creationflags"] = creationflags
+            else:
+                popen_kwargs["start_new_session"] = True
+
+            proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **popen_kwargs)
+            cdp_url = f"http://localhost:{cdp_port}"
+            logger.info(f"Launched Chrome for CDP at {cdp_url} (pid={proc.pid}) using {resolved_exe}")
+            return {
+                "cdp_url": cdp_url,
+                "pid": proc.pid,
+                "exe_path": resolved_exe,
+                "user_data_dir": udd,
+            }
+        except Exception as e:
+            logger.error(f"Error launching Chrome with CDP: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to launch Chrome with CDP: {e}")
 
 
