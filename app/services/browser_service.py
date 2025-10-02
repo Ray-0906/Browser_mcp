@@ -19,6 +19,54 @@ import subprocess
 
 logger = get_logger(__name__)
 
+CLICKABLE_SELECTOR = ",".join(
+    [
+        "a[href]",
+        "button",
+        "input[type='button']",
+        "input[type='submit']",
+        "input[type='reset']",
+        "input[type='image']",
+        "[role='button']",
+        "[role='link']",
+        "[role='menuitem']",
+        "[role='menuitemcheckbox']",
+        "[role='menuitemradio']",
+        "[role='option']",
+        "[role='tab']",
+        "[role='checkbox']",
+        "[role='radio']",
+        "[role='switch']",
+        "[role='listitem']",
+        "[role='treeitem']",
+        "[role='gridcell']",
+        "[role='row']",
+        "[role='combobox']",
+        "[tabindex]",
+        "[onclick]",
+        "[contenteditable='true']",
+        "ytmusic-responsive-list-item-renderer",
+    ]
+)
+
+CLICKABLE_ROLE_HINTS: Set[str] = {
+    "button",
+    "link",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "tab",
+    "checkbox",
+    "radio",
+    "switch",
+    "treeitem",
+    "gridcell",
+    "row",
+    "combobox",
+    "listitem",
+}
+
 class BrowserService:
     def __init__(self, max_browsers: int = 1, max_contexts_per_browser: int = 5, headless: bool = True, timeout: int = 30000):
         self.max_browsers = max_browsers
@@ -343,6 +391,354 @@ class BrowserService:
         except Exception as e:
             logger.error(f"Error describing elements for session {session_id} using {selector}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to describe elements: {e}")
+
+    async def find_click_targets(
+        self,
+        session_id: str,
+        text: str,
+        exact: bool = False,
+        case_sensitive: bool = False,
+        preferred_roles: Optional[List[str]] = None,
+        max_results: int = 10,
+        include_html_preview: bool = False,
+        extra_attributes: Optional[List[str]] = None,
+        scan_limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+        if not text or not text.strip():
+            raise BrowserAutomationError("Search text must be provided.")
+        try:
+            page = self.pages[session_id]
+            target_text = text if case_sensitive else text.strip().lower()
+            roles_set: Optional[Set[str]] = {r.lower() for r in preferred_roles} if preferred_roles else None
+            dedup_attrs = list(dict.fromkeys(extra_attributes or []))
+
+            locator = page.locator(CLICKABLE_SELECTOR)
+            total_candidates = await locator.count()
+            scan_cap = total_candidates
+            if scan_limit is not None and scan_limit > 0:
+                scan_cap = min(total_candidates, scan_limit)
+            else:
+                scan_cap = min(total_candidates, 200)
+
+            matches: List[Dict[str, Any]] = []
+            matched_count = 0
+
+            for index in range(scan_cap):
+                element = locator.nth(index)
+                try:
+                    info = await element.evaluate(
+                        """
+                        (el, attrs) => {
+                            const rect = el.getBoundingClientRect();
+                            const attrEntries = {};
+                            if (Array.isArray(attrs)) {
+                                for (const name of attrs) {
+                                    attrEntries[name] = el.getAttribute(name);
+                                }
+                            }
+                            return {
+                                tag: el.tagName ? el.tagName.toLowerCase() : null,
+                                text: (el.innerText || el.textContent || '').trim(),
+                                id: el.id || null,
+                                className: el.className || null,
+                                role: el.getAttribute('role') || null,
+                                href: el.getAttribute('href') || null,
+                                ariaLabel: el.getAttribute('aria-label') || null,
+                                title: el.getAttribute('title') || null,
+                                value: typeof el.value === 'string' ? el.value : null,
+                                disabled: el.matches(':disabled'),
+                                checked: el.matches(':checked'),
+                                rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                                attributes: attrEntries,
+                            };
+                        }
+                        """,
+                        dedup_attrs,
+                    )
+                except Exception:
+                    continue
+
+                if not info:
+                    continue
+
+                role = info.get("role")
+                if roles_set and (role is None or role.lower() not in roles_set):
+                    continue
+
+                classes_raw = info.get("className") or ""
+                classes = [cls for cls in classes_raw.split() if cls]
+
+                attributes = info.get("attributes") or {}
+
+                search_pool: List[tuple[str, str]] = []
+                text_value = (info.get("text") or "").strip()
+                if text_value:
+                    search_pool.append(("text", text_value))
+                aria_label = (info.get("ariaLabel") or "").strip()
+                if aria_label:
+                    search_pool.append(("aria_label", aria_label))
+                title_value = (info.get("title") or "").strip()
+                if title_value:
+                    search_pool.append(("title", title_value))
+                value_attr = (info.get("value") or "").strip()
+                if value_attr:
+                    search_pool.append(("value", value_attr))
+                for attr_name, attr_value in attributes.items():
+                    if attr_value:
+                        search_pool.append((f"attr:{attr_name}", attr_value.strip()))
+
+                matched_field: Optional[str] = None
+                matched_value: Optional[str] = None
+                exact_match = False
+
+                for field_name, field_value in search_pool:
+                    if not field_value:
+                        continue
+                    compare_value = field_value if case_sensitive else field_value.lower()
+                    needle = text if case_sensitive else target_text
+                    if not needle:
+                        continue
+                    match_found = compare_value == needle if exact else needle in compare_value
+                    if match_found:
+                        matched_field = field_name
+                        matched_value = field_value
+                        exact_match = compare_value == needle
+                        break
+
+                if not matched_field:
+                    continue
+
+                matched_count += 1
+
+                bounding_box = info.get("rect") or {}
+                visible = await element.is_visible()
+                enabled = await element.is_enabled()
+
+                suggested_locator = None
+                tag = info.get("tag")
+                if tag and (info.get("id") or classes):
+                    parts: List[str] = [tag]
+                    if info.get("id"):
+                        parts.append(f"#{info['id']}")
+                    if classes:
+                        parts.extend([f".{cls}" for cls in classes[:3]])
+                    suggested_locator = "".join(parts)
+
+                score = 0.0
+                if exact_match:
+                    score += 2.5
+                if matched_field == "text":
+                    score += 1.5
+                elif matched_field and matched_field.startswith("aria"):
+                    score += 1.0
+                elif matched_field and matched_field.startswith("attr:"):
+                    score += 0.8
+                if visible:
+                    score += 1.5
+                if enabled:
+                    score += 0.5
+                if info.get("disabled"):
+                    score -= 1.5
+                if role and role.lower() in CLICKABLE_ROLE_HINTS:
+                    score += 1.0
+                if tag in {"button", "a", "input", "ytmusic-responsive-list-item-renderer"}:
+                    score += 0.5
+                if classes and any("play" in cls.lower() for cls in classes):
+                    score += 0.4
+                if matched_value:
+                    similarity = 1.0 - min(abs(len(matched_value) - len(text)) / max(len(text), 1), 1.0)
+                    score += 0.5 * similarity
+                confidence = max(0.0, min(score / 6.0, 1.0))
+
+                record: Dict[str, Any] = {
+                    "index": index,
+                    "tag": tag,
+                    "id": info.get("id"),
+                    "classes": classes or None,
+                    "role": role,
+                    "text": text_value or None,
+                    "aria_label": aria_label or None,
+                    "title": title_value or None,
+                    "href": info.get("href"),
+                    "value": info.get("value"),
+                    "disabled": info.get("disabled"),
+                    "checked": info.get("checked"),
+                    "visible": visible,
+                    "enabled": enabled,
+                    "bounding_box": bounding_box,
+                    "match_field": matched_field,
+                    "match_text": matched_value,
+                    "exact_match": exact_match,
+                    "suggested_locator": suggested_locator,
+                    "confidence": round(confidence, 2),
+                }
+
+                filtered_attributes = {k: v for k, v in attributes.items() if v}
+                if filtered_attributes:
+                    record["attributes"] = filtered_attributes
+
+                record["text_snippet"] = (text_value or matched_value or "")[:120] if (text_value or matched_value) else None
+                record["_element_index"] = index
+
+                matches.append(record)
+
+            matches.sort(key=lambda item: (-item["confidence"], item["index"]))
+            limited_matches = matches[: max_results if max_results and max_results > 0 else len(matches)]
+
+            if include_html_preview and limited_matches:
+                for entry in limited_matches:
+                    idx = entry.get("_element_index")
+                    if idx is None:
+                        continue
+                    element = locator.nth(idx)
+                    try:
+                        outer_html = await element.evaluate("el => el.outerHTML || ''")
+                        entry["outer_html_preview"] = outer_html[:500]
+                    except Exception:
+                        continue
+
+            for entry in limited_matches:
+                entry.pop("_element_index", None)
+                if not entry.get("text_snippet"):
+                    entry.pop("text_snippet", None)
+
+            return {
+                "query": text,
+                "case_sensitive": case_sensitive,
+                "exact": exact,
+                "preferred_roles": preferred_roles,
+                "total_candidates": total_candidates,
+                "scanned": scan_cap,
+                "total_matches": matched_count,
+                "returned": len(limited_matches),
+                "more_available": matched_count > len(limited_matches),
+                "elements": limited_matches,
+            }
+        except BrowserAutomationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error finding click targets for session {session_id}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to find click targets: {e}")
+
+    async def click_by_text(
+        self,
+        session_id: str,
+        text: str,
+        exact: bool = False,
+        preferred_roles: Optional[List[str]] = None,
+        timeout: Optional[int] = None,
+        nth: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+        if not text or not text.strip():
+            raise BrowserAutomationError("Text must be provided for click_by_text.")
+        try:
+            page = self.pages[session_id]
+            search_text = text.strip()
+            roles_set: Optional[Set[str]] = {r.lower() for r in preferred_roles} if preferred_roles else None
+
+            locator = page.get_by_text(search_text, exact=exact)
+            candidate_count = await locator.count()
+            if candidate_count == 0:
+                raise ElementNotFoundError(search_text)
+
+            indices: List[int]
+            if nth is not None:
+                indices = [nth]
+            else:
+                indices = list(range(candidate_count))
+
+            last_error: Optional[Exception] = None
+
+            for idx in indices:
+                if idx < 0 or idx >= candidate_count:
+                    continue
+                candidate = locator.nth(idx)
+                try:
+                    if roles_set:
+                        role = await candidate.get_attribute("role")
+                        if role is None or role.lower() not in roles_set:
+                            continue
+                    if not await candidate.is_visible():
+                        continue
+                    await candidate.click(timeout=timeout if timeout is not None else self.timeout)
+                    logger.info(f"Session {session_id} clicked text '{search_text}' (index={idx}).")
+                    return {
+                        "session_id": session_id,
+                        "text": search_text,
+                        "clicked_index": idx,
+                        "total_candidates": candidate_count,
+                        "preferred_roles": preferred_roles,
+                    }
+                except Exception as click_error:
+                    last_error = click_error
+                    logger.debug(
+                        "Failed attempt clicking text '%s' at index %s in session %s: %s",
+                        search_text,
+                        idx,
+                        session_id,
+                        click_error,
+                        exc_info=True,
+                    )
+                    continue
+
+            if roles_set:
+                for role in roles_set:
+                    role_locator = page.get_by_role(role, name=search_text, exact=exact)
+                    role_count = await role_locator.count()
+                    for idx in range(role_count):
+                        candidate = role_locator.nth(idx)
+                        try:
+                            if not await candidate.is_visible():
+                                continue
+                            await candidate.click(timeout=timeout if timeout is not None else self.timeout)
+                            logger.info(
+                                "Session %s clicked text '%s' via role '%s' (index=%s).",
+                                session_id,
+                                search_text,
+                                role,
+                                idx,
+                            )
+                            return {
+                                "session_id": session_id,
+                                "text": search_text,
+                                "clicked_index": idx,
+                                "role": role,
+                                "total_candidates": candidate_count,
+                                "preferred_roles": preferred_roles,
+                            }
+                        except Exception as click_error:
+                            last_error = click_error
+                            logger.debug(
+                                "Failed role-based click for '%s' role '%s' index %s in session %s: %s",
+                                search_text,
+                                role,
+                                idx,
+                                session_id,
+                                click_error,
+                                exc_info=True,
+                            )
+                            continue
+
+            if last_error:
+                logger.error(
+                    "Unable to click text '%s' in session %s after %s attempts: %s",
+                    search_text,
+                    session_id,
+                    len(indices),
+                    last_error,
+                )
+                raise ElementNotInteractableError(search_text)
+
+            raise ElementNotInteractableError(search_text)
+        except BrowserAutomationError:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error clicking text '{text}' in session {session_id}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to click text '{text}': {e}")
 
     async def get_accessibility_tree(
         self,

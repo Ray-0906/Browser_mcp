@@ -8,6 +8,7 @@ Browser automation tools and resources exposed over the Model Context Protocol (
 - 🧠 **Smart session creation** − `create_session` auto-detects a local debugging browser, falling back to a managed Playwright instance when none exists.
 - 📡 **Resource exports** − Stream page content, screenshots, and session metadata through MCP resources for downstream tools.
 - 🔍 **Text-first page insight** − Use `inspect_elements` and `get_accessibility_tree` to understand the live DOM structure without resorting to screenshots.
+- 🎯 **Heuristic action helpers** − `find_click_targets` ranks likely buttons/links (e.g., play controls) and `click_by_text` activates visible matches while honoring ARIA roles.
 - ⚙️ **FastAPI companion app** − Optional REST interface for integrating browser automation into traditional workflows.
 
 ## Setup Instructions
@@ -166,6 +167,8 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 - Use tool get_page_content with arguments: { "session_id": "<SESSION_ID>" }
 - Use tool take_screenshot with arguments: { "session_id": "<SESSION_ID>", "full_page": true }
 - Use tool inspect_elements when a selector fails: { "session_id": "<SESSION_ID>", "selector": "ytmusic-responsive-list-item-renderer", "max_elements": 5 }
+- Use tool find_click_targets to locate actionable controls: { "session_id": "<SESSION_ID>", "text": "Play", "preferred_roles": ["button"] }
+- Use tool click_by_text when selectors are unstable: { "session_id": "<SESSION_ID>", "text": "Play", "preferred_roles": ["button"], "exact": false }
 - Use tool get_accessibility_tree to list the screen-reader visible items: { "session_id": "<SESSION_ID>", "role_filter": ["link", "button"] }
 - Use tool close_session with arguments: { "session_id": "<SESSION_ID>" }
 
@@ -173,6 +176,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 - `inspect_elements` returns up to N matches for a selector (tag, text, attributes, visibility, bounding box, optional HTML preview). Perfect for disambiguating long selector lists or diagnosing “element not visible” errors.
 - `get_accessibility_tree` streams a truncated accessibility snapshot (roles, names, state flags) so the LLM can reason about the UI hierarchy using plain text.
+- `find_click_targets` scans the page for likely interactive controls matching the supplied text (inner text, aria-label, title, custom attributes) and ranks them by confidence. Combine with `click_by_text` to trigger the best option without crafting a brittle selector.
 - Prefer these text-only diagnostics before falling back to `take_screenshot`; they keep conversations token-friendly and work even when the client cannot display images.
 
 Resources:

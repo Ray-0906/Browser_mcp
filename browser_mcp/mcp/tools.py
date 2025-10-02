@@ -551,6 +551,103 @@ async def inspect_elements(
         raise MCPError(f"Unexpected error: {e}")
 
 
+@mcp.tool(description="Search for clickable elements whose labels or attributes match the provided text, returning ranked options.")
+async def find_click_targets(
+    session_id: str,
+    text: str,
+    exact: Optional[bool] = False,
+    case_sensitive: Optional[bool] = False,
+    preferred_roles: Optional[List[str]] = None,
+    max_results: Optional[int] = 10,
+    include_html_preview: Optional[bool] = False,
+    extra_attributes: Optional[List[str]] = None,
+    scan_limit: Optional[int] = None,
+    *,
+    ctx: Context[ServerSession, AppContext],
+) -> Dict[str, Any]:
+    app_ctx = require_app_context(ctx)
+    try:
+        summary = await app_ctx.browser_service.find_click_targets(
+            session_id=session_id,
+            text=text,
+            exact=bool(exact),
+            case_sensitive=bool(case_sensitive),
+            preferred_roles=preferred_roles,
+            max_results=max_results if max_results is not None else 10,
+            include_html_preview=bool(include_html_preview),
+            extra_attributes=extra_attributes,
+            scan_limit=scan_limit,
+        )
+        await app_ctx.session_manager.update_session_activity(
+            session_id,
+            "find_click_targets",
+            {
+                "query": text,
+                "returned": summary.get("returned"),
+                "total_matches": summary.get("total_matches"),
+                "preferred_roles": preferred_roles,
+                "exact": bool(exact),
+                "case_sensitive": bool(case_sensitive),
+            },
+        )
+        return {
+            "session_id": session_id,
+            "message": "Click target search complete.",
+            **summary,
+        }
+    except SessionNotFoundError as e:
+        raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+    except BrowserAutomationError as e:
+        raise MCPError(e.message, details=e.to_dict())
+    except Exception as e:  # noqa: BLE001
+        raise MCPError(f"Unexpected error: {e}")
+
+
+@mcp.tool(description="Click the first visible element whose text (or ARIA label/title) matches the provided text, with optional role filtering.")
+async def click_by_text(
+    session_id: str,
+    text: str,
+    exact: Optional[bool] = False,
+    preferred_roles: Optional[List[str]] = None,
+    timeout: Optional[int] = None,
+    nth: Optional[int] = None,
+    *,
+    ctx: Context[ServerSession, AppContext],
+) -> Dict[str, Any]:
+    app_ctx = require_app_context(ctx)
+    try:
+        result = await app_ctx.browser_service.click_by_text(
+            session_id=session_id,
+            text=text,
+            exact=bool(exact),
+            preferred_roles=preferred_roles,
+            timeout=timeout,
+            nth=nth,
+        )
+        await app_ctx.session_manager.update_session_activity(
+            session_id,
+            "click_by_text",
+            {
+                "text": text,
+                "exact": bool(exact),
+                "preferred_roles": preferred_roles,
+                "nth": nth,
+            },
+        )
+        result.update({"message": "Click by text executed."})
+        return result
+    except SessionNotFoundError as e:
+        raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+    except ElementNotFoundError as e:
+        raise MCPError(f"Element not found: {text}", details=e.to_dict())
+    except ElementNotInteractableError as e:
+        raise MCPError(f"Element not interactable: {text}", details=e.to_dict())
+    except BrowserAutomationError as e:
+        raise MCPError(e.message, details=e.to_dict())
+    except Exception as e:  # noqa: BLE001
+        raise MCPError(f"Unexpected error: {e}")
+
+
 @mcp.tool(description="Capture an accessibility tree snapshot (roles, names, states) to understand screen-reader-visible structure without screenshots.")
 async def get_accessibility_tree(
     session_id: str,
