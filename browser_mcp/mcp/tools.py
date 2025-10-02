@@ -30,21 +30,59 @@ async def create_session(
     headless: Optional[bool] = None,
     viewport_width: Optional[int] = None,
     viewport_height: Optional[int] = None,
+    use_cdp: Optional[bool] = None,
+    cdp_url: Optional[str] = None,
+    create_new_page: Optional[bool] = True,
     *,
     ctx: Context[ServerSession, AppContext],
 ) -> Dict[str, Any]:
     app_ctx = require_app_context(ctx)
     try:
-        session_info = await app_ctx.browser_service.create_session(
-            session_id=session_id,
-            browser_type=browser_type or "chromium",
-            headless=headless,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-        )
+        requested_cdp = bool(use_cdp)
+        auto_detect_cdp = use_cdp is None
+        resolved_cdp_url = cdp_url or "http://localhost:9222"
+        session_info: Dict[str, Any]
+        used_cdp = False
+
+        if requested_cdp or auto_detect_cdp:
+            try:
+                session_info = await app_ctx.browser_service.connect_cdp_session(
+                    session_id=session_id,
+                    cdp_url=resolved_cdp_url,
+                    create_new_page=True if create_new_page is None else create_new_page,
+                )
+                used_cdp = True
+                message = "Connected to existing browser via CDP."
+            except BrowserAutomationError as e:
+                if requested_cdp:
+                    logger.error("Failed to connect via CDP at %s: %s", resolved_cdp_url, e.message, exc_info=True)
+                    raise MCPError(f"Failed to connect via CDP: {e.message}", details=e.to_dict())
+                logger.debug("CDP auto-detection failed at %s: %s. Falling back to launching a browser.", resolved_cdp_url, e.message)
+            except Exception as e:  # noqa: BLE001
+                if requested_cdp:
+                    logger.error("Unexpected error during CDP connection attempt: %s", e, exc_info=True)
+                    raise MCPError(f"Unexpected error during CDP connection: {e}")
+                logger.debug("CDP auto-detection raised %r; falling back to new session.", e)
+
+        if not used_cdp:
+            session_info = await app_ctx.browser_service.create_session(
+                session_id=session_id,
+                browser_type=browser_type or "chromium",
+                headless=headless,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+            )
+            message = "Session created successfully."
         await app_ctx.session_manager.register_session(session_info["session_id"], session_info)
-        logger.info("Session %s created successfully.", session_info["session_id"])
-        return {"session_id": session_info["session_id"], "message": "Session created successfully."}
+        logger.info(
+            "Session %s ready via %s.",
+            session_info["session_id"],
+            "CDP" if used_cdp else session_info.get("browser_type", browser_type),
+        )
+        result: Dict[str, Any] = {"session_id": session_info["session_id"], "message": message}
+        if used_cdp:
+            result["cdp_url"] = session_info.get("cdp_url", resolved_cdp_url)
+        return result
     except BrowserAutomationError as e:
         logger.error("Failed to create session: %s", e.message, exc_info=True)
         raise MCPError(f"Failed to create session: {e.message}", details=e.to_dict())
@@ -463,6 +501,91 @@ async def get_links(
             "count": len(filtered),
             "selector": scope,
             "message": "Links extracted.",
+        }
+    except SessionNotFoundError as e:
+        raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+    except BrowserAutomationError as e:
+        raise MCPError(e.message, details=e.to_dict())
+    except Exception as e:  # noqa: BLE001
+        raise MCPError(f"Unexpected error: {e}")
+
+
+@mcp.tool(description="Inspect elements matching a selector, returning visible text, attributes, and bounding boxes for better action planning.")
+async def inspect_elements(
+    session_id: str,
+    selector: str,
+    max_elements: Optional[int] = 10,
+    include_html_preview: Optional[bool] = False,
+    extra_attributes: Optional[List[str]] = None,
+    *,
+    ctx: Context[ServerSession, AppContext],
+) -> Dict[str, Any]:
+    app_ctx = require_app_context(ctx)
+    try:
+        summary = await app_ctx.browser_service.describe_elements(
+            session_id,
+            selector,
+            max_elements=max_elements if max_elements is not None else 10,
+            include_html_preview=bool(include_html_preview),
+            extra_attributes=extra_attributes,
+        )
+        await app_ctx.session_manager.update_session_activity(
+            session_id,
+            "inspect_elements",
+            {
+                "selector": selector,
+                "total_matches": summary.get("total_matches"),
+                "returned": summary.get("returned"),
+            },
+        )
+        return {
+            "session_id": session_id,
+            "message": "Element inspection complete.",
+            **summary,
+        }
+    except SessionNotFoundError as e:
+        raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+    except BrowserAutomationError as e:
+        raise MCPError(e.message, details=e.to_dict())
+    except Exception as e:  # noqa: BLE001
+        raise MCPError(f"Unexpected error: {e}")
+
+
+@mcp.tool(description="Capture an accessibility tree snapshot (roles, names, states) to understand screen-reader-visible structure without screenshots.")
+async def get_accessibility_tree(
+    session_id: str,
+    max_depth: Optional[int] = 3,
+    max_nodes: Optional[int] = 120,
+    role_filter: Optional[List[str]] = None,
+    name_filter: Optional[str] = None,
+    interesting_only: Optional[bool] = True,
+    *,
+    ctx: Context[ServerSession, AppContext],
+) -> Dict[str, Any]:
+    app_ctx = require_app_context(ctx)
+    try:
+        tree = await app_ctx.browser_service.get_accessibility_tree(
+            session_id,
+            max_depth=max_depth if max_depth is not None else 3,
+            max_nodes=max_nodes if max_nodes is not None else 120,
+            role_filter=role_filter,
+            name_filter=name_filter,
+            interesting_only=interesting_only if interesting_only is not None else True,
+        )
+        await app_ctx.session_manager.update_session_activity(
+            session_id,
+            "get_accessibility_tree",
+            {
+                "node_count": tree.get("node_count"),
+                "max_depth": tree.get("max_depth"),
+                "roles": tree.get("roles"),
+                "name_filter": tree.get("name_filter"),
+            },
+        )
+        return {
+            "session_id": session_id,
+            "message": "Accessibility tree captured.",
+            **tree,
         }
     except SessionNotFoundError as e:
         raise MCPError(f"Session not found: {session_id}", details=e.to_dict())

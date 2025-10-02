@@ -4,14 +4,22 @@ Browser automation tools and resources exposed over the Model Context Protocol (
 
 ## Features
 
- - MCP tools: create/close session, navigate, click, type, get page content, take screenshot, get text excerpt, get links, connect to visible Chrome via CDP.
- - Resources: active_sessions, session_info/{session_id}, page_content/{session_id}?... and screenshot/{session_id}?...
- - Playwright for Chromium/Firefox/WebKit.
- - Optional FastAPI app for HTTP endpoints.
+- ✅ **Universal browser control** − Navigate, click, type, capture content, extract links, take screenshots, and even drive your own Chrome/Edge via CDP.
+- 🧠 **Smart session creation** − `create_session` auto-detects a local debugging browser, falling back to a managed Playwright instance when none exists.
+- 📡 **Resource exports** − Stream page content, screenshots, and session metadata through MCP resources for downstream tools.
+- 🔍 **Text-first page insight** − Use `inspect_elements` and `get_accessibility_tree` to understand the live DOM structure without resorting to screenshots.
+- ⚙️ **FastAPI companion app** − Optional REST interface for integrating browser automation into traditional workflows.
 
 ## Setup Instructions
 
 Follow these steps to set up and run the Browser Automation MCP Server on your local machine.
+
+## Architecture at a glance
+
+- **`browser_mcp/`** – FastMCP app built with decorator-registered tools/resources and a lifespan-managed `AppContext`.
+- **`app/services/`** – Playwright-backed browser/session services plus CDP helpers for visible Chrome/Edge.
+- **`mcp_server.py`** – CL-friendly entrypoint that wires logging, configures the FastMCP instance, and serves over stdio.
+- **`app/main.py`** – Optional FastAPI app mirroring the MCP capabilities for REST integrations.
 
 ### Prerequisites
 
@@ -130,8 +138,8 @@ python -m playwright install
 {
     "mcpServers": {
         "browser-automation": {
-            "command": "C:/Users/astra/Desktop/browser_automation_mcp_server_uv/.venv/Scripts/python.exe",
-            "args": ["C:/Users/astra/Desktop/browser_automation_mcp_server_uv/mcp_server.py"],
+        "command": "C:/Users/astra/Desktop/browser_automation_mcp_server_uv/.venv/Scripts/python.exe",
+        "args": ["C:/Users/astra/Desktop/browser_automation_mcp_server_uv/mcp_server.py"],
             "cwd": "C:/Users/astra/Desktop/browser_automation_mcp_server_uv",
             "env": {}
         }
@@ -149,13 +157,23 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 ## MCP quick tests (prompts for Claude)
-- Use tool create_session with arguments: { "browser_type": "chromium", "headless": true }
+- Use tool create_session with empty arguments `{}` – it will first try to attach to Chrome at `http://localhost:9222` and fall back to launching Playwright if none is available.
+- Force a new automation browser with { "use_cdp": false, "browser_type": "chromium", "headless": true }.
+- Explicitly attach to a specific debugging endpoint with { "use_cdp": true, "cdp_url": "http://localhost:9222" } after starting Chrome with remote debugging to drive your own browser profile.
 - Use tool navigate with arguments: { "session_id": "<SESSION_ID>", "url": "https://example.com" }
 - Use tool click_element with arguments: { "session_id": "<SESSION_ID>", "selector": "a.more-info" }
 - Use tool type_text with arguments: { "session_id": "<SESSION_ID>", "selector": "input[name='q']", "text": "playwright mcp" }
 - Use tool get_page_content with arguments: { "session_id": "<SESSION_ID>" }
 - Use tool take_screenshot with arguments: { "session_id": "<SESSION_ID>", "full_page": true }
+- Use tool inspect_elements when a selector fails: { "session_id": "<SESSION_ID>", "selector": "ytmusic-responsive-list-item-renderer", "max_elements": 5 }
+- Use tool get_accessibility_tree to list the screen-reader visible items: { "session_id": "<SESSION_ID>", "role_filter": ["link", "button"] }
 - Use tool close_session with arguments: { "session_id": "<SESSION_ID>" }
+
+### Understand pages without screenshots
+
+- `inspect_elements` returns up to N matches for a selector (tag, text, attributes, visibility, bounding box, optional HTML preview). Perfect for disambiguating long selector lists or diagnosing “element not visible” errors.
+- `get_accessibility_tree` streams a truncated accessibility snapshot (roles, names, state flags) so the LLM can reason about the UI hierarchy using plain text.
+- Prefer these text-only diagnostics before falling back to `take_screenshot`; they keep conversations token-friendly and work even when the client cannot display images.
 
 Resources:
 - Read resource active_sessions
@@ -180,7 +198,7 @@ Outputs:
 1) Start Chrome with remote debugging:
      - Windows PowerShell:
          "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\\temp\\chrome-debug"
-2) Use tool `connect_cdp` with arguments: { "cdp_url": "http://localhost:9222", "create_new_page": true }
+2) Use tool `connect_cdp` with arguments: { "cdp_url": "http://localhost:9222", "create_new_page": true } or simply call `create_session` with `{}` (auto-detect) or `{ "use_cdp": true, "cdp_url": "http://localhost:9222", "create_new_page": true }` to attach in a single step.
 3) Navigate, click, type as usual. Closing the session will not close your Chrome.
 
 ## Troubleshooting

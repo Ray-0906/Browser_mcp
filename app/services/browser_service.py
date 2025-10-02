@@ -241,6 +241,177 @@ class BrowserService:
             logger.error(f"Error getting page content for session {session_id}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to get page content: {e}")
 
+    async def describe_elements(
+        self,
+        session_id: str,
+        selector: str,
+        max_elements: int = 10,
+        include_html_preview: bool = False,
+        extra_attributes: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+        try:
+            page = self.pages[session_id]
+            locator = page.locator(selector)
+            total_matches = await locator.count()
+            limit = total_matches if max_elements is None or max_elements <= 0 else min(max_elements, total_matches)
+            results: List[Dict[str, Any]] = []
+
+            for index in range(limit):
+                element = locator.nth(index)
+                element_info = await element.evaluate(
+                    """
+                    (el) => ({
+                        tag: el.tagName ? el.tagName.toLowerCase() : null,
+                        id: el.id || null,
+                        className: el.className || null,
+                        name: el.getAttribute('name') || null,
+                        ariaLabel: el.getAttribute('aria-label') || null,
+                        role: el.getAttribute('role') || null,
+                        type: el.getAttribute('type') || null,
+                        placeholder: el.getAttribute('placeholder') || null,
+                        title: el.getAttribute('title') || null,
+                        href: el.getAttribute('href') || null,
+                        text: (el.innerText || '').trim(),
+                        value: typeof el.value === 'string' ? el.value : null,
+                        disabled: el.matches(':disabled'),
+                        checked: el.matches(':checked'),
+                    })
+                    """
+                )
+
+                classes_raw = element_info.pop("className", None)
+                classes: Optional[List[str]] = None
+                if classes_raw:
+                    classes = [cls for cls in classes_raw.split() if cls]
+
+                extra_attrs: Dict[str, Any] = {}
+                if extra_attributes:
+                    extra_attrs = await element.evaluate(
+                        "(el, names) => Object.fromEntries(names.map(name => [name, el.getAttribute(name)]))",
+                        extra_attributes,
+                    )
+
+                bounding_box = await element.bounding_box()
+                visible = await element.is_visible()
+
+                element_record: Dict[str, Any] = {
+                    "index": index,
+                    "tag": element_info.get("tag"),
+                    "id": element_info.get("id"),
+                    "classes": classes,
+                    "role": element_info.get("role"),
+                    "name": element_info.get("name"),
+                    "aria_label": element_info.get("ariaLabel"),
+                    "type": element_info.get("type"),
+                    "placeholder": element_info.get("placeholder"),
+                    "title": element_info.get("title"),
+                    "href": element_info.get("href"),
+                    "text": element_info.get("text"),
+                    "value": element_info.get("value"),
+                    "disabled": element_info.get("disabled"),
+                    "checked": element_info.get("checked"),
+                    "visible": visible,
+                    "bounding_box": bounding_box,
+                }
+
+                if extra_attrs:
+                    element_record["attributes"] = {k: v for k, v in extra_attrs.items() if v is not None}
+
+                if include_html_preview:
+                    outer_html = await element.evaluate("el => el.outerHTML || ''")
+                    preview = outer_html[:500]
+                    element_record["outer_html_preview"] = preview
+
+                if element_record.get("tag") and (element_record.get("id") or classes):
+                    parts: List[str] = [element_record["tag"]]
+                    if element_record.get("id"):
+                        parts.append(f"#{element_record['id']}")
+                    if classes:
+                        parts.extend([f".{c}" for c in classes[:3]])
+                    element_record["suggested_locator"] = "".join(parts)
+
+                results.append(element_record)
+
+            return {
+                "selector": selector,
+                "total_matches": total_matches,
+                "returned": len(results),
+                "elements": results,
+            }
+        except Exception as e:
+            logger.error(f"Error describing elements for session {session_id} using {selector}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to describe elements: {e}")
+
+    async def get_accessibility_tree(
+        self,
+        session_id: str,
+        max_depth: int = 3,
+        max_nodes: int = 120,
+        role_filter: Optional[List[str]] = None,
+        name_filter: Optional[str] = None,
+        interesting_only: bool = True,
+    ) -> Dict[str, Any]:
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+        try:
+            page = self.pages[session_id]
+            snapshot = await page.accessibility.snapshot(interesting_only=interesting_only)
+            results: List[Dict[str, Any]] = []
+            role_filter_set: Optional[Set[str]] = {r.lower() for r in role_filter} if role_filter else None
+            name_filter_value = name_filter.lower() if name_filter else None
+
+            def walk(node: Optional[Dict[str, Any]], depth: int, path: str) -> None:
+                if node is None or depth > max_depth or len(results) >= max_nodes:
+                    return
+
+                role = node.get("role")
+                name = node.get("name")
+                include_node = True
+                if role_filter_set and (role or "").lower() not in role_filter_set:
+                    include_node = False
+                if include_node and name_filter_value and name:
+                    include_node = name_filter_value in name.lower()
+                elif include_node and name_filter_value and not name:
+                    include_node = False
+
+                if include_node:
+                    results.append(
+                        {
+                            "path": path,
+                            "depth": depth,
+                            "role": role,
+                            "name": name,
+                            "value": node.get("value"),
+                            "description": node.get("description"),
+                            "focused": node.get("focused"),
+                            "checked": node.get("checked"),
+                            "disabled": node.get("disabled"),
+                            "actions": node.get("actions"),
+                        }
+                    )
+
+                children = node.get("children") or []
+                for idx, child in enumerate(children):
+                    if len(results) >= max_nodes:
+                        break
+                    next_path = f"{path}.{idx}" if path else str(idx)
+                    walk(child, depth + 1, next_path)
+
+            walk(snapshot, 0, "")
+            return {
+                "node_count": len(results),
+                "max_depth": max_depth,
+                "max_nodes": max_nodes,
+                "roles": role_filter,
+                "name_filter": name_filter,
+                "nodes": results,
+            }
+        except Exception as e:
+            logger.error(f"Error getting accessibility tree for session {session_id}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to get accessibility tree: {e}")
+
     async def take_screenshot(self, session_id: str, full_page: bool = False, encoding: str = "base64") -> str:
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)
