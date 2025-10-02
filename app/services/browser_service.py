@@ -205,6 +205,20 @@ class BrowserService:
                 raise InvalidSelectorError(selector)
             raise ElementError(selector, message=str(e))
 
+    async def press_key(self, session_id: str, key: str, delay: Optional[int] = None):
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+        try:
+            page = self.pages[session_id]
+            if delay is not None:
+                await page.keyboard.press(key, delay=max(0, int(delay)))
+            else:
+                await page.keyboard.press(key)
+            logger.info(f"Session {session_id} pressed key {key}")
+        except Exception as e:
+            logger.error(f"Error pressing key {key} in session {session_id}: {e}", exc_info=True)
+            raise BrowserAutomationError(f"Failed to press key {key}: {e}")
+
     async def get_page_content(self, session_id: str, selector: Optional[str] = None, content_format: str = "html") -> str:
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)

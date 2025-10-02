@@ -232,6 +232,35 @@ async def type_text(
         raise MCPError(f"Unexpected error: {e}")
 
 
+@mcp.tool(description="Press a keyboard key within the active page of a session.")
+async def press_key(
+    session_id: str,
+    key: str,
+    delay: Optional[int] = None,
+    *,
+    ctx: Context[ServerSession, AppContext],
+) -> Dict[str, Any]:
+    app_ctx = require_app_context(ctx)
+    try:
+        await app_ctx.browser_service.press_key(session_id, key, delay)
+        await app_ctx.session_manager.update_session_activity(
+            session_id,
+            "press_key",
+            {"key": key, "delay": delay},
+        )
+        logger.info("Session %s pressed key %s.", session_id, key)
+        return {"session_id": session_id, "key": key, "message": "Key pressed."}
+    except SessionNotFoundError as e:
+        logger.warning("Key press attempt on non-existent session %s.", session_id)
+        raise MCPError(f"Session not found: {session_id}", details=e.to_dict())
+    except BrowserAutomationError as e:
+        logger.error("Failed to press key %s in session %s: %s", key, session_id, e.message, exc_info=True)
+        raise MCPError(f"Failed to press key: {e.message}", details=e.to_dict())
+    except Exception as e:  # noqa: BLE001
+        logger.error("Unexpected error during key press: %s", e, exc_info=True)
+        raise MCPError(f"Unexpected error: {e}")
+
+
 @mcp.tool(
     description="Retrieve page content as HTML or plain text, optionally scoped to a selector and truncated to avoid token limits."
 )
