@@ -4,5 +4,7 @@ playwright
 mcp
 pydantic-settings
 PyJWT
+html2text
+readability-lxml
 
 

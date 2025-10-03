@@ -1,16 +1,61 @@
-from typing import Dict, Any,List, Optional
+from typing import Dict, Any, List, Optional
 import asyncio
+import hashlib
 from datetime import datetime, timedelta
 from app.core.logging import get_logger
 from app.core.exceptions import SessionNotFoundError
 
 logger = get_logger(__name__)
 
+class PageElementCache:
+    def __init__(self, expiry_minutes: int = 5):
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.expiry = timedelta(minutes=expiry_minutes)
+
+    def _key(self, session_id: str, url: str, selector: str = "", variant: str = "default") -> str:
+        raw = f"{session_id}:{url}:{selector}:{variant}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def get(
+        self,
+        session_id: str,
+        url: str,
+        selector: str = "",
+        variant: str = "default",
+        current_hash: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        key = self._key(session_id, url, selector, variant)
+        entry = self.cache.get(key)
+        if not entry:
+            return None
+        if datetime.utcnow() - entry["timestamp"] > self.expiry:
+            self.cache.pop(key, None)
+            return None
+        if current_hash is not None and entry.get("page_hash") and entry["page_hash"] != current_hash:
+            self.cache.pop(key, None)
+            return None
+        return entry
+
+    def set(self, session_id: str, url: str, data: Dict[str, Any], selector: str = "", variant: str = "default", page_hash: Optional[str] = None) -> None:
+        key = self._key(session_id, url, selector, variant)
+        self.cache[key] = {
+            "timestamp": datetime.utcnow(),
+            "data": data,
+            "page_hash": page_hash,
+        }
+
+    def invalidate(self, session_id: str) -> None:
+        keys = [k for k in self.cache if k.startswith(session_id)]
+        for key in keys:
+            self.cache.pop(key, None)
+
+
 class SessionManager:
     def __init__(self, session_timeout_minutes: int = 60):
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self.session_timeout_minutes = session_timeout_minutes
         self._cleanup_task = None
+        self.element_cache = PageElementCache()
 
     async def register_session(self, session_id: str, session_info: Dict[str, Any]):
         self.sessions[session_id] = {
@@ -25,6 +70,7 @@ class SessionManager:
         if session_id in self.sessions:
             del self.sessions[session_id]
             logger.info(f"Session {session_id} unregistered.")
+            self.element_cache.invalidate(session_id)
         else:
             raise SessionNotFoundError(session_id)
 

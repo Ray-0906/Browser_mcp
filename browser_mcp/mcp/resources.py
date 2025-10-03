@@ -32,3 +32,21 @@ async def session_info_resource(
     if not session_info:
         raise MCPError(f"Session not found: {session_id}")
     return {"session_id": session_id, "info": session_info, "message": "Session info retrieved."}
+
+
+@mcp.resource(
+    "resource://page_markdown/{session_id}",
+    description="Preprocessed HTML and markdown for the current page, optimized for token-friendly summaries.",
+    mime_type="application/json",
+)
+async def page_markdown_resource(
+    session_id: str,
+) -> dict[str, Any]:
+    app_ctx = require_app_context()
+    payload = await app_ctx.browser_service.preprocess_page_content(session_id=session_id)
+    await app_ctx.session_manager.update_session_activity(
+        session_id,
+        "preprocess_page_content",
+        {"selector": None, "token_savings": payload.get("token_savings")},
+    )
+    return payload | {"message": "Page content preprocessed."}

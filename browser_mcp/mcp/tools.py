@@ -517,6 +517,8 @@ async def inspect_elements(
     max_elements: Optional[int] = 10,
     include_html_preview: Optional[bool] = False,
     extra_attributes: Optional[List[str]] = None,
+    use_cache: Optional[bool] = True,
+    force_refresh: Optional[bool] = False,
     *,
     ctx: Context[ServerSession, AppContext],
 ) -> Dict[str, Any]:
@@ -528,6 +530,8 @@ async def inspect_elements(
             max_elements=max_elements if max_elements is not None else 10,
             include_html_preview=bool(include_html_preview),
             extra_attributes=extra_attributes,
+            use_cache=True if use_cache is None else bool(use_cache),
+            force_refresh=bool(force_refresh),
         )
         await app_ctx.session_manager.update_session_activity(
             session_id,
@@ -562,6 +566,8 @@ async def find_click_targets(
     include_html_preview: Optional[bool] = False,
     extra_attributes: Optional[List[str]] = None,
     scan_limit: Optional[int] = None,
+    use_cache: Optional[bool] = True,
+    force_refresh: Optional[bool] = False,
     *,
     ctx: Context[ServerSession, AppContext],
 ) -> Dict[str, Any]:
@@ -577,6 +583,8 @@ async def find_click_targets(
             include_html_preview=bool(include_html_preview),
             extra_attributes=extra_attributes,
             scan_limit=scan_limit,
+            use_cache=True if use_cache is None else bool(use_cache),
+            force_refresh=bool(force_refresh),
         )
         await app_ctx.session_manager.update_session_activity(
             session_id,
@@ -656,6 +664,8 @@ async def get_accessibility_tree(
     role_filter: Optional[List[str]] = None,
     name_filter: Optional[str] = None,
     interesting_only: Optional[bool] = True,
+    use_cache: Optional[bool] = True,
+    force_refresh: Optional[bool] = False,
     *,
     ctx: Context[ServerSession, AppContext],
 ) -> Dict[str, Any]:
@@ -668,6 +678,8 @@ async def get_accessibility_tree(
             role_filter=role_filter,
             name_filter=name_filter,
             interesting_only=interesting_only if interesting_only is not None else True,
+            use_cache=True if use_cache is None else bool(use_cache),
+            force_refresh=bool(force_refresh),
         )
         await app_ctx.session_manager.update_session_activity(
             session_id,

@@ -72,9 +72,7 @@ Pick a dedicated user data directory so you don’t disturb existing sessions.
 **Windows (PowerShell)**
 ```powershell
 # Google Chrome
-"C:\Program Files\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="C:\temp\chrome-debug"
+ "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-dev-profile"
 
 # Microsoft Edge
 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" `
@@ -141,6 +139,7 @@ Update `%APPDATA%\Claude\claude_desktop_config.json` to point at `mcp_server.py`
 - `inspect_elements` returns structured data (text, attributes, bounding boxes) for up to N matches.
 - `get_accessibility_tree` streams a truncated accessibility snapshot so you can reason about the UI hierarchy.
 - `find_click_targets` ranks likely interactive controls by matching text, ARIA labels, titles, and custom attributes; pair it with `click_by_text` for a selector-free click.
+- Pull `resource://page_markdown/{session_id}` to get cleaned HTML + markdown plus token-savings metrics; reuses cached preprocessing until the page changes.
 - Prefer these text-only diagnostics before falling back to `take_screenshot` to stay token-friendly.
 
 ## Token-safe screenshots

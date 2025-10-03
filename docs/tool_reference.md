@@ -67,10 +67,16 @@ Together, `find_click_targets` → `click_by_text` provide a resilient flow for 
 | `get_text_excerpt` | Token-safe snippet of the page/selector. | Calls `get_page_content` in text mode and truncates to `max_chars`. | Direct text + metadata (length, truncation). |
 | `get_links` | Extract anchor list quickly. | `page.eval_on_selector_all` to map text/href pairs beneath a selector (default `a`). | Array of `{text, href}` objects. |
 | `take_screenshot` | Window or full page capture. | `page.screenshot`, optionally streaming bytes back as an MCP resource instead of inline base64. | Either inline `image_data` (if requested) or `resource_uri` with `mime_type`. |
-| `inspect_elements` | Structured view of matching DOM nodes. | Iterates `page.locator(selector).nth(i)` up to `max_elements`, calling `element.evaluate` to extract text, attributes, bounding boxes, visibility, disabled state, etc. | List of element descriptors, optional clipped HTML preview. |
-| `get_accessibility_tree` | Screen-reader facing structure. | Uses Playwright accessibility snapshot API with depth/node caps and optional role/name filters. | Roles, names, states, truncated to keep payload manageable. |
+| `inspect_elements` | Structured view of matching DOM nodes. | Iterates `page.locator(selector).nth(i)` up to `max_elements`, calling `element.evaluate` to extract text, attributes, bounding boxes, visibility, disabled state, etc. Results are cached per selector/attribute bundle unless `use_cache=false` or `force_refresh=true`. | List of element descriptors (tag/role/text/attributes, suggested locator, optional clipped HTML preview) served from cache when possible. |
+| `get_accessibility_tree` | Screen-reader facing structure. | Uses Playwright accessibility snapshot API with depth/node caps and optional role/name filters. Snapshot is condensed (scores, summaries, child counts) and cached per parameter set when previews are disabled. | Ranked list (`score`) of roles/names/states, truncated for token safety, plus metadata (`truncated`, applied filters). |
 
 ---
+
+### MCP resources
+
+| Resource URI | Description | Backing call |
+| --- | --- | --- |
+| `resource://page_markdown/{session_id}` | Returns cleaned article-like HTML, markdown, and token-savings metrics for the current page. Results are cached per session until the DOM hash changes. | `BrowserService.preprocess_page_content(session_id)` |
 
 ## Supporting infrastructure
 
@@ -78,6 +84,7 @@ Together, `find_click_targets` → `click_by_text` provide a resilient flow for 
 - Manages a pool of Playwright browser instances (`self.browsers`) and pages (`self.pages`) keyed by `session_id`.
 - Handles both **managed** (Playwright-launched) and **CDP-attached** sessions. For CDP, only metadata differs; downstream calls remain the same because they operate on Playwright page handles.
 - Provides utility methods like `describe_elements`, `get_accessibility_tree`, `find_click_targets`, and `click_by_text` to expose richer semantics than raw Playwright.
+- Shares a `SessionManager`-backed cache so repeated diagnostics (`describe_elements`, `find_click_targets`, `get_accessibility_tree`, `preprocess_page_content`) return instantly when the page hash hasn't changed.
 - Normalizes errors into project-specific exception classes so the MCP layer can surface actionable messages (e.g., `InvalidSelectorError`, `ElementNotFoundError`).
 
 ### SessionManager quick facts
@@ -116,6 +123,7 @@ This data is handy for telemetry, debugging, or presenting session state in a UI
 3. **Diagnostics-first debugging**
    - Run `inspect_elements` or `get_accessibility_tree` before attempting clicks.
    - Analyze the returned attributes/roles to craft a better selector or leverage `find_click_targets`.
+   - `find_click_targets` now scores each candidate (`confidence`, `similarity`, viewport bonus) and caches the ranked list so repeated lookups are nearly free unless the DOM changes.
    - Confirm visibility/enabled state before performing the action.
 
 ---

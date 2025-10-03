@@ -1,7 +1,11 @@
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
-from typing import Dict, Any, Optional, Set, List
+from typing import Dict, Any, Optional, Set, List, TYPE_CHECKING
 import asyncio
 from uuid import uuid4
+import hashlib
+import html2text  # type: ignore[import]
+from difflib import SequenceMatcher
+from collections import deque
 from app.core.logging import get_logger
 from app.core.exceptions import (
     BrowserAutomationError,
@@ -16,6 +20,10 @@ from app.core.exceptions import (
 import os
 import sys
 import subprocess
+from readability import Document  # type: ignore[import]
+
+if TYPE_CHECKING:
+    from app.services.session_service import SessionManager
 
 logger = get_logger(__name__)
 
@@ -80,6 +88,10 @@ class BrowserService:
         self._browser_counter = 0
         # Track sessions connected via CDP to a user-managed browser (visible)
         self._cdp_sessions = set()
+        self.session_manager: Optional["SessionManager"] = None
+
+    def attach_session_manager(self, session_manager: "SessionManager") -> None:
+        self.session_manager = session_manager
 
     async def _launch_browser(self, browser_type: str = "chromium", headless: Optional[bool] = None) -> Browser:
         if not self.playwright_instance:
@@ -289,6 +301,90 @@ class BrowserService:
             logger.error(f"Error getting page content for session {session_id}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to get page content: {e}")
 
+    async def _get_page_hash(self, page: Page) -> Optional[str]:
+        try:
+            content = await page.content()
+        except Exception:
+            return None
+
+        return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+    async def preprocess_page_content(
+        self,
+        session_id: str,
+        selector: Optional[str] = None,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        if session_id not in self.pages:
+            raise SessionNotFoundError(session_id)
+
+        page = self.pages[session_id]
+        session_manager = getattr(self, "session_manager", None)
+        cache_allowed = session_manager is not None and selector is None
+        cache_variant = "preprocess"
+        page_hash: Optional[str] = None
+
+        if cache_allowed and not force_refresh:
+            page_hash = await self._get_page_hash(page)
+            entry = session_manager.element_cache.get(
+                session_id,
+                page.url,
+                selector=selector or "",
+                variant=cache_variant,
+                current_hash=page_hash,
+            )
+            if entry and entry.get("data"):
+                return entry["data"]
+
+        if selector:
+            locator = page.locator(selector).first
+            raw_html = await locator.inner_html()
+        else:
+            raw_html = await page.content()
+
+        try:
+            doc = Document(raw_html)
+            clean_html = doc.summary(html_partial=True)
+        except Exception:
+            clean_html = raw_html
+
+        parser = html2text.HTML2Text()
+        parser.ignore_links = False
+        parser.ignore_images = True
+        parser.body_width = 0
+        markdown_content = parser.handle(clean_html)
+
+        original_len = len(raw_html)
+        clean_len = len(markdown_content)
+        token_savings = 0.0
+        if original_len:
+            token_savings = max(0.0, 1.0 - (clean_len / original_len))
+
+        payload = {
+            "session_id": session_id,
+            "url": page.url,
+            "selector": selector,
+            "original_length": original_len,
+            "clean_length": clean_len,
+            "token_savings": round(token_savings, 4),
+            "clean_html": clean_html,
+            "markdown": markdown_content,
+        }
+
+        if cache_allowed:
+            if page_hash is None:
+                page_hash = await self._get_page_hash(page)
+            session_manager.element_cache.set(
+                session_id,
+                page.url,
+                data=payload,
+                selector=selector or "",
+                variant=cache_variant,
+                page_hash=page_hash,
+            )
+
+        return payload
+
     async def describe_elements(
         self,
         session_id: str,
@@ -296,11 +392,32 @@ class BrowserService:
         max_elements: int = 10,
         include_html_preview: bool = False,
         extra_attributes: Optional[List[str]] = None,
+        use_cache: bool = True,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)
+
+        page = self.pages[session_id]
+        session_manager = getattr(self, "session_manager", None)
+        dedup_attrs = list(dict.fromkeys(extra_attributes or []))
+        cache_allowed = use_cache and not include_html_preview and session_manager is not None
+        cache_variant = f"describe:{max_elements}:{','.join(dedup_attrs)}"
+        page_hash: Optional[str] = None
+
+        if cache_allowed and not force_refresh:
+            page_hash = await self._get_page_hash(page)
+            entry = session_manager.element_cache.get(
+                session_id,
+                page.url,
+                selector=selector,
+                variant=cache_variant,
+                current_hash=page_hash,
+            )
+            if entry and entry.get("data"):
+                return entry["data"]
+
         try:
-            page = self.pages[session_id]
             locator = page.locator(selector)
             total_matches = await locator.count()
             limit = total_matches if max_elements is None or max_elements <= 0 else min(max_elements, total_matches)
@@ -334,11 +451,11 @@ class BrowserService:
                 if classes_raw:
                     classes = [cls for cls in classes_raw.split() if cls]
 
-                extra_attrs: Dict[str, Any] = {}
-                if extra_attributes:
-                    extra_attrs = await element.evaluate(
+                attr_values: Dict[str, Any] = {}
+                if dedup_attrs:
+                    attr_values = await element.evaluate(
                         "(el, names) => Object.fromEntries(names.map(name => [name, el.getAttribute(name)]))",
-                        extra_attributes,
+                        dedup_attrs,
                     )
 
                 bounding_box = await element.bounding_box()
@@ -364,13 +481,12 @@ class BrowserService:
                     "bounding_box": bounding_box,
                 }
 
-                if extra_attrs:
-                    element_record["attributes"] = {k: v for k, v in extra_attrs.items() if v is not None}
+                if attr_values:
+                    element_record["attributes"] = {k: v for k, v in attr_values.items() if v is not None}
 
                 if include_html_preview:
                     outer_html = await element.evaluate("el => el.outerHTML || ''")
-                    preview = outer_html[:500]
-                    element_record["outer_html_preview"] = preview
+                    element_record["outer_html_preview"] = outer_html[:500]
 
                 if element_record.get("tag") and (element_record.get("id") or classes):
                     parts: List[str] = [element_record["tag"]]
@@ -382,12 +498,26 @@ class BrowserService:
 
                 results.append(element_record)
 
-            return {
+            payload = {
                 "selector": selector,
                 "total_matches": total_matches,
                 "returned": len(results),
                 "elements": results,
             }
+
+            if cache_allowed:
+                if page_hash is None:
+                    page_hash = await self._get_page_hash(page)
+                session_manager.element_cache.set(
+                    session_id,
+                    page.url,
+                    data=payload,
+                    selector=selector,
+                    variant=cache_variant,
+                    page_hash=page_hash,
+                )
+
+            return payload
         except Exception as e:
             logger.error(f"Error describing elements for session {session_id} using {selector}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to describe elements: {e}")
@@ -403,20 +533,50 @@ class BrowserService:
         include_html_preview: bool = False,
         extra_attributes: Optional[List[str]] = None,
         scan_limit: Optional[int] = None,
+        use_cache: bool = True,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)
         if not text or not text.strip():
             raise BrowserAutomationError("Search text must be provided.")
+
         try:
             page = self.pages[session_id]
-            target_text = text if case_sensitive else text.strip().lower()
+            normalized_query = text if case_sensitive else text.strip().lower()
             roles_set: Optional[Set[str]] = {r.lower() for r in preferred_roles} if preferred_roles else None
             dedup_attrs = list(dict.fromkeys(extra_attributes or []))
 
+            session_manager = getattr(self, "session_manager", None)
+            cache_allowed = use_cache and not include_html_preview and session_manager is not None
+            cache_descriptor = "|".join(
+                [
+                    normalized_query,
+                    "exact" if exact else "fuzzy",
+                    "case" if case_sensitive else "nocase",
+                    ",".join(sorted(roles_set)) if roles_set else "*",
+                    str(max_results),
+                    str(scan_limit or 0),
+                    ",".join(dedup_attrs),
+                ]
+            )
+            cache_variant = f"click_targets:{cache_descriptor}"
+            page_hash: Optional[str] = None
+
+            if cache_allowed and not force_refresh:
+                page_hash = await self._get_page_hash(page)
+                entry = session_manager.element_cache.get(
+                    session_id,
+                    page.url,
+                    selector=CLICKABLE_SELECTOR,
+                    variant=cache_variant,
+                    current_hash=page_hash,
+                )
+                if entry and entry.get("data"):
+                    return entry["data"]
+
             locator = page.locator(CLICKABLE_SELECTOR)
             total_candidates = await locator.count()
-            scan_cap = total_candidates
             if scan_limit is not None and scan_limit > 0:
                 scan_cap = min(total_candidates, scan_limit)
             else:
@@ -492,22 +652,28 @@ class BrowserService:
                 matched_field: Optional[str] = None
                 matched_value: Optional[str] = None
                 exact_match = False
+                best_similarity = 0.0
 
                 for field_name, field_value in search_pool:
                     if not field_value:
                         continue
                     compare_value = field_value if case_sensitive else field_value.lower()
-                    needle = text if case_sensitive else target_text
+                    needle = text if case_sensitive else normalized_query
                     if not needle:
                         continue
-                    match_found = compare_value == needle if exact else needle in compare_value
-                    if match_found:
+                    if exact:
+                        match_found = compare_value == needle
+                        similarity = 1.0 if match_found else 0.0
+                    else:
+                        similarity = SequenceMatcher(None, compare_value, needle).ratio()
+                        match_found = similarity >= 0.45 or needle in compare_value
+                    if match_found and similarity >= best_similarity:
                         matched_field = field_name
                         matched_value = field_value
                         exact_match = compare_value == needle
-                        break
+                        best_similarity = similarity
 
-                if not matched_field:
+                if matched_field is None:
                     continue
 
                 matched_count += 1
@@ -527,29 +693,40 @@ class BrowserService:
                     suggested_locator = "".join(parts)
 
                 score = 0.0
+                score += 3.0 * best_similarity
                 if exact_match:
-                    score += 2.5
+                    score += 1.5
                 if matched_field == "text":
-                    score += 1.5
+                    score += 1.0
                 elif matched_field and matched_field.startswith("aria"):
-                    score += 1.0
-                elif matched_field and matched_field.startswith("attr:"):
                     score += 0.8
-                if visible:
-                    score += 1.5
-                if enabled:
+                elif matched_field and matched_field.startswith("attr:"):
                     score += 0.5
-                if info.get("disabled"):
-                    score -= 1.5
                 if role and role.lower() in CLICKABLE_ROLE_HINTS:
-                    score += 1.0
+                    score += 0.8
                 if tag in {"button", "a", "input", "ytmusic-responsive-list-item-renderer"}:
-                    score += 0.5
+                    score += 0.6
                 if classes and any("play" in cls.lower() for cls in classes):
+                    score += 0.3
+                if visible:
+                    score += 1.0
+                if enabled:
                     score += 0.4
-                if matched_value:
-                    similarity = 1.0 - min(abs(len(matched_value) - len(text)) / max(len(text), 1), 1.0)
-                    score += 0.5 * similarity
+                if info.get("disabled"):
+                    score -= 1.2
+
+                # Prefer elements near the top-left and with reasonable size
+                rect = info.get("rect") or {}
+                viewport_bonus = 0.0
+                if rect:
+                    y_pos = rect.get("y") or 0.0
+                    viewport_bonus += max(0.0, min(1.0, 1.0 - (y_pos / 1500.0)))
+                    width = rect.get("width") or 0.0
+                    height = rect.get("height") or 0.0
+                    if width * height > 0:
+                        viewport_bonus += min(1.0, (width * height) / 120000.0)
+                score += viewport_bonus
+
                 confidence = max(0.0, min(score / 6.0, 1.0))
 
                 record: Dict[str, Any] = {
@@ -571,6 +748,7 @@ class BrowserService:
                     "match_field": matched_field,
                     "match_text": matched_value,
                     "exact_match": exact_match,
+                    "similarity": round(best_similarity, 3),
                     "suggested_locator": suggested_locator,
                     "confidence": round(confidence, 2),
                 }
@@ -584,7 +762,7 @@ class BrowserService:
 
                 matches.append(record)
 
-            matches.sort(key=lambda item: (-item["confidence"], item["index"]))
+            matches.sort(key=lambda item: (-item["confidence"], -item.get("similarity", 0.0), item["index"]))
             limited_matches = matches[: max_results if max_results and max_results > 0 else len(matches)]
 
             if include_html_preview and limited_matches:
@@ -604,7 +782,7 @@ class BrowserService:
                 if not entry.get("text_snippet"):
                     entry.pop("text_snippet", None)
 
-            return {
+            payload = {
                 "query": text,
                 "case_sensitive": case_sensitive,
                 "exact": exact,
@@ -616,6 +794,20 @@ class BrowserService:
                 "more_available": matched_count > len(limited_matches),
                 "elements": limited_matches,
             }
+
+            if cache_allowed:
+                if page_hash is None:
+                    page_hash = await self._get_page_hash(page)
+                session_manager.element_cache.set(
+                    session_id,
+                    page.url,
+                    data=payload,
+                    selector=CLICKABLE_SELECTOR,
+                    variant=cache_variant,
+                    page_hash=page_hash,
+                )
+
+            return payload
         except BrowserAutomationError:
             raise
         except Exception as e:
@@ -748,62 +940,141 @@ class BrowserService:
         role_filter: Optional[List[str]] = None,
         name_filter: Optional[str] = None,
         interesting_only: bool = True,
+        use_cache: bool = True,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         if session_id not in self.pages:
             raise SessionNotFoundError(session_id)
+
         try:
             page = self.pages[session_id]
+            session_manager = getattr(self, "session_manager", None)
+            cache_allowed = use_cache and session_manager is not None
+            cache_descriptor = "|".join(
+                [
+                    str(max_depth),
+                    str(max_nodes),
+                    ",".join(role_filter or []),
+                    name_filter or "",
+                    "interesting" if interesting_only else "all",
+                ]
+            )
+            cache_variant = f"ax_snapshot:{cache_descriptor}"
+            page_hash: Optional[str] = None
+
+            if cache_allowed and not force_refresh:
+                page_hash = await self._get_page_hash(page)
+                entry = session_manager.element_cache.get(
+                    session_id,
+                    page.url,
+                    selector="accessibility",
+                    variant=cache_variant,
+                    current_hash=page_hash,
+                )
+                if entry and entry.get("data"):
+                    return entry["data"]
+
             snapshot = await page.accessibility.snapshot(interesting_only=interesting_only)
             results: List[Dict[str, Any]] = []
             role_filter_set: Optional[Set[str]] = {r.lower() for r in role_filter} if role_filter else None
             name_filter_value = name_filter.lower() if name_filter else None
 
-            def walk(node: Optional[Dict[str, Any]], depth: int, path: str) -> None:
-                if node is None or depth > max_depth or len(results) >= max_nodes:
-                    return
+            queue: deque[tuple[Optional[Dict[str, Any]], int, str]] = deque()
+            queue.append((snapshot, 0, ""))
 
-                role = node.get("role")
-                name = node.get("name")
+            while queue and len(results) < max_nodes:
+                node, depth, path = queue.popleft()
+                if node is None or depth > max_depth:
+                    continue
+
+                role = node.get("role") or ""
+                name = node.get("name") or ""
+                description = node.get("description") or ""
+                value = node.get("value")
+
                 include_node = True
-                if role_filter_set and (role or "").lower() not in role_filter_set:
+                if role_filter_set and role.lower() not in role_filter_set:
                     include_node = False
-                if include_node and name_filter_value and name:
-                    include_node = name_filter_value in name.lower()
-                elif include_node and name_filter_value and not name:
-                    include_node = False
+                if include_node and name_filter_value:
+                    if name:
+                        include_node = name_filter_value in name.lower()
+                    else:
+                        include_node = False
+
+                score = 0.0
+                if depth == 0:
+                    score += 2.0
+                if name:
+                    score += 1.0
+                if role_filter_set and role.lower() in role_filter_set:
+                    score += 1.5
+                if name_filter_value and name and name_filter_value in name.lower():
+                    score += 1.2
+                if node.get("focused"):
+                    score += 1.0
+                if node.get("checked"):
+                    score += 0.3
+                if node.get("disabled"):
+                    score -= 0.4
+
+                summary_parts: List[str] = []
+                if role:
+                    summary_parts.append(role)
+                if name:
+                    summary_parts.append(name[:160])
+                if description:
+                    summary_parts.append(description[:160])
 
                 if include_node:
-                    results.append(
-                        {
-                            "path": path,
-                            "depth": depth,
-                            "role": role,
-                            "name": name,
-                            "value": node.get("value"),
-                            "description": node.get("description"),
-                            "focused": node.get("focused"),
-                            "checked": node.get("checked"),
-                            "disabled": node.get("disabled"),
-                            "actions": node.get("actions"),
-                        }
-                    )
+                    record = {
+                        "path": path or "root",
+                        "depth": depth,
+                        "role": role or None,
+                        "name": name[:160] if name else None,
+                        "description": description[:160] if description else None,
+                        "value": value[:160] if isinstance(value, str) else value,
+                        "focused": node.get("focused"),
+                        "checked": node.get("checked"),
+                        "disabled": node.get("disabled"),
+                        "actions": node.get("actions"),
+                        "score": round(score, 2),
+                        "summary": " • ".join(summary_parts) if summary_parts else None,
+                        "child_count": len(node.get("children") or []),
+                    }
+                    results.append(record)
+
+                if len(results) >= max_nodes:
+                    break
 
                 children = node.get("children") or []
                 for idx, child in enumerate(children):
-                    if len(results) >= max_nodes:
-                        break
                     next_path = f"{path}.{idx}" if path else str(idx)
-                    walk(child, depth + 1, next_path)
+                    queue.append((child, depth + 1, next_path))
 
-            walk(snapshot, 0, "")
-            return {
+            payload = {
                 "node_count": len(results),
                 "max_depth": max_depth,
                 "max_nodes": max_nodes,
                 "roles": role_filter,
                 "name_filter": name_filter,
+                "interesting_only": interesting_only,
+                "truncated": len(results) >= max_nodes,
                 "nodes": results,
             }
+
+            if cache_allowed:
+                if page_hash is None:
+                    page_hash = await self._get_page_hash(page)
+                session_manager.element_cache.set(
+                    session_id,
+                    page.url,
+                    data=payload,
+                    selector="accessibility",
+                    variant=cache_variant,
+                    page_hash=page_hash,
+                )
+
+            return payload
         except Exception as e:
             logger.error(f"Error getting accessibility tree for session {session_id}: {e}", exc_info=True)
             raise BrowserAutomationError(f"Failed to get accessibility tree: {e}")

@@ -52,6 +52,7 @@ app.browser_service = BrowserService(
     timeout=settings.BROWSER_TIMEOUT
 )
 app.session_manager = SessionManager()
+app.browser_service.attach_session_manager(app.session_manager)
 
 # Include API routers
 app.include_router(browser.router, prefix="/browser", tags=["Browser Automation"])

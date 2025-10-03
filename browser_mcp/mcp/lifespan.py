@@ -23,6 +23,7 @@ async def app_lifespan(_: FastMCP[AppContext]) -> AsyncIterator[AppContext]:
         timeout=settings.BROWSER_TIMEOUT,
     )
     session_manager = SessionManager()
+    browser_service.attach_session_manager(session_manager)
 
     app_context = AppContext(browser_service=browser_service, session_manager=session_manager)
     set_current_app_context(app_context)
