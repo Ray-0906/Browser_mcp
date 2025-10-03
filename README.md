@@ -11,6 +11,14 @@ Browser automation tools and resources exposed over the Model Context Protocol (
 - 🖥️ **Bring-your-own browser** – Attach to an existing Chrome/Edge profile with remote debugging for full-fidelity automation on your own tabs.
 - ⚙️ **FastAPI companion app** – Optional REST interface for integrating browser automation into traditional workflows.
 
+## Performance highlights (October 2025)
+- **Cached diagnostics** – `inspect_elements`, `find_click_targets`, and accessibility snapshots reuse page-hash keyed caches for instant follow-up calls.
+- **Token-friendly summaries** – New `resource://page_markdown/{session_id}` exposes readability-trimmed HTML plus markdown with measured token savings.
+- **Smarter scoring** – Click-target search now blends fuzzy text matching, viewport heuristics, and role bonuses to surface the right control in fewer tokens.
+- **Lean accessibility data** – Snapshot responses are condensed, scored, and capped so the most actionable nodes arrive first.
+
+_See [`docs/performance_notes.md`](docs/performance_notes.md) for the full breakdown, including implementation details and challenges solved during the optimization pass._
+
 ## Project structure
 - `mcp_server.py` – MCP server wiring using `mcp.server` (stdio transport).
 - `browser_mcp/` – FastMCP app with tool/resource registrations and shared context.
